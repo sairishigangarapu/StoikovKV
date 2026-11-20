@@ -34,11 +34,11 @@ reddyprathams@gmail.com}
 \maketitle
 
 \begin{abstract}
-Key-Value cache memory footprint and high-bandwidth memory read traffic constitute the primary bottlenecks in long-context and multi-batch large language model inference. Existing training-free compression methods enforce a homogeneous policy across all attention heads, creating an unresolved trilemma. First, heavy-hitter eviction methods require explicit quadratic attention weight matrices that are incompatible with FlashAttention, suffer from early-context needle blindness when filler tokens overflow the eviction budget, and retain stale tokens after multi-turn topic shifts. Second, uniform low-bit quantization degrades sharp induction heads and still scans the full sequence length at every layer. Third, sparse dictionary coding blurs exact token retrieval on copy heads and incurs prohibitive iterative solver latency. We present StoikovKV, a hybrid Key-Value cache compression and self-speculative decoding architecture for Grouped-Query Attention transformers. Offline, StoikovKV extracts a low-rank orthonormal query subspace per Key-Value head group in linear memory without materializing attention matrices, classifies heads into three functional tiers (uncompressed retrieval heads, heavy-hitter eviction heads, and sparse dictionary heads), and precomputes a double-precision ridge preconditioner in the pre-rotary embedding frame. Online, StoikovKV scores incoming tokens at write time via directional query-subspace probing and pre-rotary key rarity span detection, decays stale heavy hitters upon non-stationary topic transitions via a Hidden Markov regime controller, and executes single-step preconditioned ElasticNet encoding with magnitude-sorted atoms. Because dictionary atoms are sorted by descending magnitude, StoikovKV enables single-model Matryoshka self-speculative decoding that drafts tokens using a truncated atom prefix and verifies in a single batched pass. Evaluated on pretrained Qwen2.5-1.5B-Instruct, Qwen2.5-7B-Instruct, and controlled multi-turn benchmarks at a 20 percent Key-Value memory budget, StoikovKV achieves 100 percent passkey retrieval across all context depths (where SnapKV and 2-bit quantization drop to 0 percent), 0.9850 multi-turn logit cosine similarity, 9.82 to 30.35 times faster encoding than Orthogonal Matching Pursuit, 75.88 percent decoding bandwidth savings, and 2.11 times higher maximum batch serving throughput under a fixed memory ceiling.
+Key-Value cache memory footprint and high-bandwidth memory read traffic constitute the primary bottlenecks in long-context and multi-batch large language model inference. Existing training-free compression methods enforce a homogeneous policy across all attention heads, creating an unresolved trilemma. First, heavy-hitter eviction methods require explicit quadratic attention weight matrices that are incompatible with FlashAttention, suffer from early-context needle blindness when filler tokens overflow the eviction budget, and retain stale tokens after multi-turn topic shifts. Second, uniform low-bit quantization degrades sharp induction heads and still scans the full sequence length at every layer. Third, sparse dictionary coding blurs exact token retrieval on copy heads and incurs prohibitive iterative solver latency. We present StoikovKV, a hybrid Key-Value cache compression and self-speculative decoding architecture for Grouped-Query Attention transformers inspired by the Avellaneda-Stoikov inventory-control formulation from quantitative market making. Offline, StoikovKV extracts a low-rank orthonormal query subspace per Key-Value head group in linear memory without materializing attention matrices, classifies heads into three functional tiers (uncompressed retrieval heads, heavy-hitter eviction heads, and sparse dictionary heads), and precomputes a double-precision ridge preconditioner in the pre-rotary embedding frame. Online, StoikovKV scores incoming tokens at write time via directional query-subspace probing and pre-rotary key rarity span detection, decays stale heavy hitters upon non-stationary topic transitions via a Hidden Markov regime controller, and executes single-step preconditioned ElasticNet encoding with magnitude-sorted atoms. Because dictionary atoms are sorted by descending magnitude, StoikovKV enables single-model Matryoshka self-speculative decoding that drafts tokens using a truncated atom prefix and verifies in a single batched pass. Evaluated on pretrained Qwen2.5-1.5B-Instruct, Qwen2.5-7B-Instruct, and controlled multi-turn benchmarks at a 20 percent Key-Value memory budget, StoikovKV achieves 100 percent passkey retrieval across all context depths (where SnapKV and 2-bit quantization drop to 0 percent), 0.9850 multi-turn logit cosine similarity, 9.82 to 30.35 times faster encoding than Orthogonal Matching Pursuit, 75.88 percent decoding bandwidth savings, and 2.11 times higher maximum batch serving throughput under a fixed memory ceiling.
 \end{abstract}
 
 \begin{IEEEkeywords}
-large language models, key-value cache compression, grouped-query attention, query subspace probing, sparse dictionary coding, speculative decoding, hidden markov models
+large language models, key-value cache compression, avellaneda-stoikov inventory control, grouped-query attention, query subspace probing, sparse dictionary coding, speculative decoding, hidden markov models
 \end{IEEEkeywords}
 
 \section{Introduction}
@@ -61,6 +61,26 @@ To resolve this trilemma, we introduce \textbf{StoikovKV}, a heterogeneous per-h
 \end{itemize}
 
 \section{Methodology}
+
+\subsection{Avellaneda--Stoikov Inventory-Control Formulation}
+The design of StoikovKV is grounded in the Avellaneda--Stoikov optimal market-making framework \cite{b13}. In limit-order-book inventory control, an agent managing signed inventory $q$ under mid-price $s$, price volatility $\sigma$, risk aversion $\gamma_{\text{risk}}$, and remaining horizon $(T - t)$ skews its reservation (indifference) price $r(s, q, t)$ and optimal bid--ask spread $\delta_a + \delta_b$ as:
+\begin{equation}
+r(s, q, t) = s - q \gamma_{\text{risk}} \sigma^2 (T - t),
+\label{eq:as_reservation}
+\end{equation}
+\begin{equation}
+\delta_a + \delta_b = \gamma_{\text{risk}} \sigma^2 (T - t) + \frac{2}{\gamma_{\text{risk}}} \ln\!\left(1 + \frac{\gamma_{\text{risk}}}{\kappa}\right),
+\label{eq:as_spread}
+\end{equation}
+where $\kappa$ denotes order-arrival intensity.
+
+We establish a direct structural mapping between \eqref{eq:as_reservation}--\eqref{eq:as_spread} and online KV-cache memory management:
+\begin{itemize}
+    \item \textbf{Mid-Price $s \leftrightarrow$ Write-Time Salience $I_t$:} Each incoming token's intrinsic utility is estimated at write time via directional query-subspace projection without materializing the attention matrix.
+    \item \textbf{Inventory $q \leftrightarrow$ Resident KV Cache Pressure:} Memory occupancy above the target compression budget ($\sim 20\%$ of FP16) acts as excess inventory that must be liquidated (evicted) or hedged (sparsely encoded).
+    \item \textbf{Volatility $\sigma^2 \leftrightarrow$ Subspace Regime Variance $\sigma_c^2$:} Measured online by \texttt{HMMTopicShiftController}. When a multi-turn topic shift spikes $\sigma_c^2$, the inventory penalty $q \gamma_{\text{risk}} \sigma^2 (T - t)$ in \eqref{eq:as_reservation} sharply discounts stale Turn-1 token reservation values, operationalized via the non-stationary decay pulse $\beta_{\text{shift}} = 0.65$.
+    \item \textbf{Risk Aversion $\gamma_{\text{risk}} \leftrightarrow$ Per-Head Eviction Risk:} Retrieval/copy heads carry unacceptable accuracy loss upon eviction and are hedged in exact FP16; low-entropy peaked heads tolerate aggressive inventory liquidation via heavy-hitter eviction; diffuse high-entropy heads widen the effective compression spread via nested $s$-sparse dictionary atoms.
+\end{itemize}
 
 \subsection{Offline Streaming Calibration and Directional Subspace Probing}
 Consider a GQA transformer with $L$ layers, $H_Q$ query heads, $H_{KV}$ KV heads ($g = H_Q / H_{KV}$ queries per KV group), and head dimension $d = 128$. During offline calibration over a small set of calibration prompts ($N_{\text{cal}} = 16$, completing in $8.92\text{ s}$ on a single RTX 4060 Laptop GPU), we hook \texttt{q\_proj}, \texttt{k\_proj}, and \texttt{v\_proj} while running standard SDPA (\texttt{output\_attentions=False}). For each layer $l$ and KV head $h \in \{1, \dots, H_{KV}\}$, let $Q_{l,h} \in \mathbb{R}^{M \times d}$ denote the post-RoPE query states pooled across all $g$ query heads sharing KV head $h$.
@@ -356,6 +376,7 @@ We presented StoikovKV, a unified KV-cache compression and self-speculative deco
 \bibitem{b10} A. Kusupati, G. Bhatt, A. Rege, M. Wallingford, A. Sinha, V. Ramanujan, W. Howard-Snyder, K. Chen, S. Kakade, P. Jain, and A. Farhadi, ``Matryoshka representation learning,'' in \textit{Adv. Neural Inf. Process. Syst. (NeurIPS)}, vol. 35, 2022, pp. 30233--30249.
 \bibitem{b11} A. Yang, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Li, D. Liu, F. Huang, H. Wei, H. Lin, J. Yang, J. Tu, J. Zhang, J. Yang, J. Yang, J. Zhou, and J. Lin, ``Qwen2.5 technical report,'' \textit{arXiv preprint arXiv:2412.15115}, 2024.
 \bibitem{b12} Y. Leviathan, M. Kalman, and Y. Matias, ``Fast inference from transformers via speculative decoding,'' in \textit{Proc. Int. Conf. Mach. Learn. (ICML)}, 2023, pp. 19274--19286.
+\bibitem{b13} M. Avellaneda and S. Stoikov, ``High-frequency trading in a limit order book,'' \textit{Quantitative Finance}, vol. 8, no. 3, pp. 217--224, Apr. 2008.
 \end{thebibliography}
 
 \end{document}
