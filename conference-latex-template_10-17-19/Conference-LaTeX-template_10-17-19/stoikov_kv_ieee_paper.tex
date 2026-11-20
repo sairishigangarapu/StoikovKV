@@ -53,7 +53,7 @@ Prior training-free KV compression paradigms treat all KV heads identically, lea
 
 To resolve this trilemma, we introduce \textbf{StoikovKV}, a heterogeneous per-head KV-cache routing and self-speculative inference engine. StoikovKV is built on five technical contributions:
 \begin{itemize}
-    \item \textbf{Streaming $O(T \cdot r)$ Write-Time Directional Query-Subspace Probing:} We extract a rank-$r$ ($r = 16$) orthonormal query basis $U_Q \in \mathbb{R}^{d \times r}$ per GQA head group with column $0$ anchored to the normalized mean query direction $\hat{\mu}_Q$. Incoming tokens are scored at write time in $O(d \cdot r)$ operations without `output_attentions=True`, outperforming the value-norm baseline $\|V_t\|_2$ by $+0.6087$ Spearman $\rho$ on pretrained \texttt{Qwen/Qwen2.5-1.5B-Instruct}.
+    \item \textbf{Streaming $O(T \cdot r)$ Write-Time Directional Query-Subspace Probing:} We extract a rank-$r$ ($r = 16$) orthonormal query basis $U_Q \in \mathbb{R}^{d \times r}$ per GQA head group with column $0$ anchored to the normalized mean query direction $\hat{\mu}_Q$. Incoming tokens are scored at write time in $O(d \cdot r)$ operations without \texttt{output\_attentions=True}, outperforming the value-norm baseline $\|V_t\|_2$ by $+0.6087$ Spearman $\rho$ on pretrained \texttt{Qwen/Qwen2.5-1.5B-Instruct}.
     \item \textbf{Three-Tier Entropy $\times$ Needle-Selectivity Head Router with Layer Co-Location:} StoikovKV partitions KV heads into \texttt{ROLE\_RETRIEVAL\_FP16} ($\sim 5.4\%$, exact FP16 retention), \texttt{ROLE\_PEAKED\_H2O} ($\sim 84\%\text{--}89\%$, physically compacted heavy-hitter eviction), and \texttt{ROLE\_DIFFUSE\_LEXICO} ($\sim 5.4\%\text{--}10.7\%$, sparse dictionary coding). By co-locating diffuse dictionary heads onto retrieval layers, $89.3\%$ of transformer layers remain $100\%$ pure H2O and execute directly on physically compacted tensors with a single virtual partition-sink token.
     \item \textbf{Pre-RoPE Key Rarity Span Probing and Position-Free HMM Topic-Shift Decay:} By un-rotating keys into the pre-RoPE frame $K_{\text{pre}} = R_{-\theta, t} K_t$, repeated haystack filler collapses to high-redundancy directions while unique multi-token BPE entities (such as 5-digit passkeys) stand out as contiguous high-rarity spans. Concurrently, an online Hidden Markov Model (\texttt{HMMTopicShiftController}) monitors position-free value-subspace drift, pulsing the H2O decay factor from $\beta_{\text{stat}} = 0.99$ to $\beta_{\text{shift}} = 0.65$ upon topic shifts to flush stale filler while shielding high-rarity anchors.
     \item \textbf{Pre-RoPE 1-Step FP64 Ridge-Preconditioned ElasticNet Codec:} We train near-orthonormal per-layer dictionaries $D \in \mathbb{R}^{d \times N}$ on pre-RoPE keys and values and solve $W_{\text{ridge}} = (D^\top D + \lambda_2 I)^{-1} D^\top$ in FP64 (relative residual $< 1.5 \times 10^{-15}$). Live encoding requires a single GEMM, soft-thresholding, descending-magnitude top-$s$ selection, closed-form scalar rescaling, and \texttt{int8} quantization ($3s + 2$ bytes/vector), running $9.82\times\text{--}30.35\times$ faster than OMP on real \texttt{Qwen2.5-1.5B} activations.
@@ -63,7 +63,7 @@ To resolve this trilemma, we introduce \textbf{StoikovKV}, a heterogeneous per-h
 \section{Methodology}
 
 \subsection{Offline Streaming Calibration and Directional Subspace Probing}
-Consider a GQA transformer with $L$ layers, $H_Q$ query heads, $H_{KV}$ KV heads ($g = H_Q / H_{KV}$ queries per KV group), and head dimension $d = 128$. During offline calibration over a small set of calibration prompts ($N_{\text{cal}} = 16$, completing in $8.92\text{ s}$ on a single RTX 4060 Laptop GPU), we hook `q_proj`, `k_proj`, and `v_proj` while running standard SDPA (`output_attentions=False`). For each layer $l$ and KV head $h \in \{1, \dots, H_{KV}\}$, let $Q_{l,h} \in \mathbb{R}^{M \times d}$ denote the post-RoPE query states pooled across all $g$ query heads sharing KV head $h$.
+Consider a GQA transformer with $L$ layers, $H_Q$ query heads, $H_{KV}$ KV heads ($g = H_Q / H_{KV}$ queries per KV group), and head dimension $d = 128$. During offline calibration over a small set of calibration prompts ($N_{\text{cal}} = 16$, completing in $8.92\text{ s}$ on a single RTX 4060 Laptop GPU), we hook \texttt{q\_proj}, \texttt{k\_proj}, and \texttt{v\_proj} while running standard SDPA (\texttt{output\_attentions=False}). For each layer $l$ and KV head $h \in \{1, \dots, H_{KV}\}$, let $Q_{l,h} \in \mathbb{R}^{M \times d}$ denote the post-RoPE query states pooled across all $g$ query heads sharing KV head $h$.
 
 Because exponential softmax attention $\exp(q \cdot k / \sqrt{d})$ is sign-sensitive along the mean query direction, an unsigned norm $\|K_t U_Q\|_2$ assigns identically high scores to keys aligned ($+u_0$) and anti-aligned ($-u_0$) with queries. We therefore anchor the first column of the rank-$r$ basis $U_{Q,l,h} = [u_0, u_1, \dots, u_{r-1}] \in \mathbb{R}^{d \times r}$ to the unit mean query direction:
 \begin{equation}
@@ -106,7 +106,10 @@ When a multi-digit passkey (e.g., \texttt{"94812"}) is tokenized by a Byte-Pair 
 
 In StoikovKV's hybrid mode, we invert RoPE to recover position-free keys $\hat{K}_{\text{pre}, t} = R_{-\theta, t} K_t / \|K_t\|_2$. For any two positions $t, t'$ separated by $|t - t'| > 40$, repeated haystack sentences exhibit $\langle \hat{K}_{\text{pre}, t}, \hat{K}_{\text{pre}, t'} \rangle > 0.95$, whereas a unique planted fact or passkey span has low distant similarity. We define the contiguous \textbf{Pre-RoPE Key Rarity Span Score}:
 \begin{equation}
-\mathcal{R}_{\text{span}}(t) = \text{AvgPool}_{w=15}\!\left(1 - \frac{1}{k} \sum_{j=1}^{k} \text{TopK}_{|t - t'| > 40}\!\left(\langle \hat{K}_{\text{pre}, t}, \hat{K}_{\text{pre}, t'} \rangle\right)_j\right).
+\begin{aligned}
+\mathcal{R}_{\text{span}}(t) = \text{AvgPool}_{w=15}\Biggl(1 - \frac{1}{k} \sum_{j=1}^{k} \text{TopK}_{|t - t'| > 40} \\
+\Bigl(\langle \hat{K}_{\text{pre}, t}, \hat{K}_{\text{pre}, t'} \rangle\Bigr)_j\Biggr).
+\end{aligned}
 \label{eq:rarity_span}
 \end{equation}
 Smoothing over a $15$-token span ensures all constituent BPE tokens of a rare entity receive a contiguous salience anchor boost ($+80.0$ on the top $4.5\%$ rarity span).
@@ -157,6 +160,7 @@ All experiments are executed on an NVIDIA GeForce RTX 4060 Laptop GPU ($8\text{ 
 \begin{table}[t]
 \caption{Write-Time Subspace Probe Correlation vs. True Future Attention across 336 Held-Out (Layer, Prompt) Pairs}
 \begin{center}
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{|l|c|c|}
 \hline
 \textbf{Probe Variant} & \textbf{Spearman $\rho$} & \textbf{Recall@20\%} \\
@@ -173,7 +177,8 @@ Value-Norm Baseline ($\|V_t\|_2$ only) & $-0.0354$ & 22.70\% \\
 Sink-Aug. Directional Probe ($+100$ on $0..3$) & 0.4892 $\pm$ 0.2233 & 56.51\% $\pm$ 18.02\% \\
 Value-Norm Baseline ($\|V_t\|_2$ only) & 0.5612 & 58.70\% \\
 \hline
-\end{tabular}
+\end{tabular}%
+}
 \label{tab:probe_corr}
 \end{center}
 \end{table}
@@ -181,10 +186,11 @@ Value-Norm Baseline ($\|V_t\|_2$ only) & 0.5612 & 58.70\% \\
 \begin{table*}[t]
 \caption{Sparse Dictionary Codec Benchmark: Fast 1-Step Ridge-Preconditioned ElasticNet vs. Iterative OMP and 30-Step FISTA on 1,024 KV Vectors ($d=128$, CUDA FP16)}
 \begin{center}
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|}
 \hline
 \textbf{Track /} & \textbf{Payload} & \textbf{Ratio vs.} & \textbf{Fast 1-Step} & \textbf{OMP} & \textbf{FISTA} & \textbf{Fast Enc.} & \textbf{OMP Enc.} & \textbf{FISTA Enc.} & \textbf{Speedup} & \textbf{Speedup} \\
-\textbf{Sparsity $s$} & \textbf{(`3s+2`)} & \textbf{FP16 (`256B`)} & \textbf{Cosine} & \textbf{Cosine} & \textbf{Cosine} & \textbf{(ms)} & \textbf{(ms)} & \textbf{(ms)} & \textbf{vs. OMP} & \textbf{vs. FISTA} \\
+\textbf{Sparsity $s$} & \textbf{(\texttt{3s+2})} & \textbf{FP16 (\texttt{256B})} & \textbf{Cosine} & \textbf{Cosine} & \textbf{Cosine} & \textbf{(ms)} & \textbf{(ms)} & \textbf{(ms)} & \textbf{vs. OMP} & \textbf{vs. FISTA} \\
 \hline
 \multicolumn{11}{|c|}{\textit{Real Pretrained \texttt{Qwen/Qwen2.5-1.5B-Instruct} Layer-10 KV Activations ($D \in \mathbb{R}^{128 \times 128}$, FP64 Residual $7.31 \times 10^{-16}$)}} \\
 \hline
@@ -202,19 +208,21 @@ $s = 12$ & 38 B & $6.74\times$  & 0.7713 & 0.7750 & 0.7748 & \textbf{0.531} & 3.
 $s = 16$ & 50 B & $5.12\times$  & 0.8103 & 0.8153 & 0.8151 & \textbf{0.527} & 4.957  & 8.336  & \textbf{9.40$\times$}  & \textbf{15.81$\times$} \\
 $s = 32$ & 98 B & $2.61\times$  & 0.8945 & 0.9067 & 0.9064 & \textbf{0.594} & 18.776 & 8.979  & \textbf{31.60$\times$} & \textbf{15.11$\times$} \\
 \hline
-\end{tabular}
+\end{tabular}%
+}
 \label{tab:codec_results}
 \end{center}
 \end{table*}
 
 \subsection{Write-Time Subspace Probe and Fast Sparse Codec Analysis}
-Table~\ref{tab:probe_corr} and Fig.~\ref{fig:probe_corr} evaluate our write-time subspace probe across $336$ strictly held-out `(layer, prompt)` pairs. On real pretrained \texttt{Qwen/Qwen2.5-1.5B-Instruct} weights, post-RoPE value norms $\|V_t\|_2$ exhibit a slightly negative rank correlation with true attention ($\rho = -0.0354$). In contrast, StoikovKV's directional query-subspace probe achieves $\rho = 0.4020 \pm 0.2887$ on non-sink tokens ($t \ge 4$) and $\rho = 0.5733 \pm 0.2716$ with sink protection—a $+0.6087$ Spearman $\rho$ gain over $\|V_t\|_2$.
+Table~\ref{tab:probe_corr} and Fig.~\ref{fig:probe_corr} evaluate our write-time subspace probe across $336$ strictly held-out (layer, prompt) pairs. On real pretrained \texttt{Qwen/Qwen2.5-1.5B-Instruct} weights, post-RoPE value norms $\|V_t\|_2$ exhibit a slightly negative rank correlation with true attention ($\rho = -0.0354$). In contrast, StoikovKV's directional query-subspace probe achieves $\rho = 0.4020 \pm 0.2887$ on non-sink tokens ($t \ge 4$) and $\rho = 0.5733 \pm 0.2716$ with sink protection---a $+0.6087$ Spearman $\rho$ gain over $\|V_t\|_2$.
 
 Table~\ref{tab:codec_results} and Fig.~\ref{fig:codec_bench} benchmark our 1-step ridge-preconditioned ElasticNet encoder against sequential greedy OMP and 30-step FISTA on $1,024$ KV vectors. Because $D_l \in \mathbb{R}^{128 \times 128}$ is trained with a Gram coherence regularizer and inverted in FP64, our single-GEMM encoder matches OMP cosine similarity within $0.004\text{--}0.012$ across all sparsity levels while maintaining flat sub-millisecond latency ($0.527\text{--}0.940\text{ ms}$), delivering up to $30.35\times\text{--}31.60\times$ speedup over OMP and $11.46\times\text{--}16.87\times$ speedup over FISTA.
 
 \begin{table*}[t]
 \caption{6-Way Equal-Budget ($\sim$20\% KV Memory) Multi-Turn Cache Ablation on Pretrained \texttt{Qwen/Qwen2.5-1.5B-Instruct} and Controlled 2K GQA}
 \begin{center}
+\resizebox{\textwidth}{!}{%
 \begin{tabular}{|l|c|c|c|c|c|c|c|c|c|c|}
 \hline
 \textbf{Configuration} & \textbf{Policy Mode} & \textbf{$\rho_{\text{keep}}$ / $s$} & \textbf{KV Mem \%} & \textbf{+Dict \%} & \textbf{Needle Acc.} & \textbf{Logit Margin} & \textbf{Turn-2 CSS} & \textbf{Turn-2 H2O} & \textbf{HMM} & \textbf{Composite} \\
@@ -238,7 +246,8 @@ KIVI-2bit Quant \cite{b6}& \texttt{quant\_int4}       & 1.000 / 16 & 19.79\%  & 
 Standalone Lexico \cite{b7}& \texttt{standalone\_lexico}& 1.000 / 14 & 19.79\%  & 22.93\%  & 50.0\% (2/4)  & $+1367.9$ & 0.8569 & 0.00\%  & 0 & 67.84\% \\
 \textbf{StoikovKV Hybrid} & \textbf{\texttt{hybrid}}  & \textbf{0.121 / 10} & \textbf{19.76\%} & \textbf{20.44\%} & \textbf{100.0\% (4/4)} & \textbf{$+2541.0$} & \textbf{0.9093} & \textbf{100.00\%} & \textbf{8} & \textbf{95.47\%} \\
 \hline
-\end{tabular}
+\end{tabular}%
+}
 \label{tab:ablation_6way}
 \end{center}
 \end{table*}
@@ -260,6 +269,7 @@ Table~\ref{tab:ablation_6way} and Fig.~\ref{fig:pareto} present our 6-way equal-
 \begin{table}[t]
 \caption{Multi-Length Needle-in-a-Haystack Retrieval Accuracy (15 Runs = 5 Trials $\times$ 3 Seeds per Cell)}
 \begin{center}
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{|c|c|c|c|c|}
 \hline
 \textbf{Context} & \textbf{Needle Depth} & \textbf{Full FP16} & \textbf{Standalone} & \textbf{StoikovKV} \\
@@ -269,7 +279,8 @@ Table~\ref{tab:ablation_6way} and Fig.~\ref{fig:pareto} present our 6-way equal-
 2,048 & 10\% / 50\% / 90\% & 100/100/100\% & \textbf{0}/100/100\% & \textbf{100/100/100\%} \\
 4,096 & 10\% / 50\% / 90\% & 100/100/100\% & \textbf{0}/100/100\% & \textbf{100/100/100\%} \\
 \hline
-\end{tabular}
+\end{tabular}%
+}
 \label{tab:niah_lengths}
 \end{center}
 \end{table}
@@ -285,6 +296,7 @@ Table~\ref{tab:niah_lengths} further confirms across $135$ evaluations ($512$, $
 \begin{table}[t]
 \caption{Matryoshka Self-Speculative Decoding Sweep ($\gamma_{\text{spec}}=4, s=16$)}
 \begin{center}
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{|c|c|c|c|c|c|}
 \hline
 \textbf{Draft} & \textbf{Draft} & \textbf{Accept} & \textbf{Tokens /} & \textbf{KV Read /} & \textbf{BW Saved} \\
@@ -295,7 +307,8 @@ $m = 4$  & 14 B & \textbf{0.9615} & \textbf{4.33} & 7,477.5 KB & \textbf{75.70\%
 $m = 8$  & 26 B & \textbf{0.9615} & \textbf{4.33} & 7,586.6 KB & \textbf{75.35\%} \\
 $m = 12$ & 38 B & \textbf{0.9615} & \textbf{4.33} & 7,695.8 KB & \textbf{74.99\%} \\
 \hline
-\end{tabular}
+\end{tabular}%
+}
 \label{tab:matryoshka_sweep}
 \end{center}
 \end{table}
@@ -303,6 +316,7 @@ $m = 12$ & 38 B & \textbf{0.9615} & \textbf{4.33} & 7,695.8 KB & \textbf{74.99\%
 \begin{table}[t]
 \caption{Multi-Batch Memory-Ceiling and System Throughput Scaling on Pretrained \texttt{Qwen/Qwen2.5-1.5B-Instruct} (128 MB KV Pool, $L=1,024$)}
 \begin{center}
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{|c|c|c|c|c|}
 \hline
 \textbf{Batch} & \multicolumn{2}{c|}{\textbf{Full FP16 KV Cache}} & \multicolumn{2}{c|}{\textbf{StoikovKV Hybrid ($\sim$20\%)}} \\
@@ -315,7 +329,8 @@ $B = 4$  & 109.92 MB & \textbf{70.8 tok/s (Max)} & \textbf{24.11 MB} & 54.6 tok/
 $B = 8$  & 227.50 MB & \textit{OOM (0.0)} & \textbf{48.22 MB} & \textbf{105.9 tok/s} \\
 $B = 12$ & 341.25 MB & \textit{OOM (0.0)} & \textbf{72.33 MB} & \textbf{149.1 tok/s (2.11$\times$)} \\
 \hline
-\end{tabular}
+\end{tabular}%
+}
 \label{tab:batch_scaling}
 \end{center}
 \end{table}
