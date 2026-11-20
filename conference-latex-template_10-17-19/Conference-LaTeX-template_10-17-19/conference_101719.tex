@@ -6,6 +6,7 @@
 \usepackage{graphicx}
 \usepackage{textcomp}
 \usepackage{xcolor}
+\usepackage{url}
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 \begin{document}
@@ -362,6 +363,9 @@ Finally, Table~\ref{tab:batch_scaling} addresses the systems throughput-versus-m
 
 \section{Conclusion}
 We presented StoikovKV, a unified KV-cache compression and self-speculative decoding library for GQA language models. By combining FlashAttention-compatible write-time directional query-subspace probing, pre-RoPE key rarity span protection, three-tier per-head routing, position-free HMM topic-shift score decay, 1-step FP64 ridge-preconditioned ElasticNet coding, and Matryoshka single-pass self-speculative verification, StoikovKV eliminates the early-needle blindness of token eviction and the latency and induction-blurring bottlenecks of uniform quantization and iterative dictionary coding. Across real pretrained \texttt{Qwen2.5} checkpoints and multi-turn benchmarks, StoikovKV preserves $100\%$ passkey retrieval and $0.9850$ logit cosine similarity at $\sim 20\%$ physical KV memory while more than doubling memory-capped batch serving throughput.
+
+\section*{Code and Data Availability}
+The complete StoikovKV source code, automated unit tests, reproducible benchmark scripts, and consolidated benchmark results reported in this paper are publicly available at \url{https://github.com/sairishigangarapu/StoikovKV}. All pretrained model evaluations use publicly released weights from Hugging Face (\texttt{Qwen/Qwen2.5-1.5B-Instruct} and \texttt{Qwen/Qwen2.5-7B-Instruct}) and the public WikiText-103 dataset.
 
 \begin{thebibliography}{00}
 \bibitem{b1} J. Ainslie, J. Lee-Thorp, M. de Jong, Y. Zemlyanskiy, F. Lebr\'{o}n, and S. Sanghai, ``GQA: Training generalized multi-query transformer models from multi-head checkpoints,'' in \textit{Proc. Conf. Empirical Methods Natural Lang. Process. (EMNLP)}, 2023, pp. 4895--4901.
