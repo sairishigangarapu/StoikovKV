@@ -582,6 +582,61 @@ class HMMTopicShiftController:
 # Per-Head Tier Storage Structures
 # ============================================================================
 
+ROLE_QUANT_LOWBIT: int = 3
+
+
+def _quantize_lowbit_2bit(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Packs a `[B, T, 128]` FP16/FP32 vector into KIVI-style 2-bit asymmetric group-quantized format
+    (`G = 3` groups covering 128 channels -> `32` packed `uint8` bytes + `3` FP16 mins + `3` FP16 scales
+    = `44` physical bytes/vector, i.e., `17.19%` of FP16's `256` bytes/vector).
+    """
+    bsz, seq_len, d_head = x.shape
+    xf = x.float()
+    # Partition 128 channels into 3 groups: [0:44], [44:88], [88:128]
+    g_slices = (slice(0, 44), slice(44, 88), slice(88, d_head))
+    mins = []
+    scales = []
+    codes = torch.empty((bsz, seq_len, d_head), dtype=torch.uint8, device=x.device)
+    for g_s in g_slices:
+        xg = xf[..., g_s]
+        g_min = xg.amin(dim=-1, keepdim=True)
+        g_max = xg.amax(dim=-1, keepdim=True)
+        g_scale = ((g_max - g_min) / 3.0).clamp(min=1e-6)
+        q = torch.round((xg - g_min) / g_scale).clamp(0.0, 3.0).to(torch.uint8)
+        codes[..., g_s] = q
+        mins.append(g_min.to(torch.float16))
+        scales.append(g_scale.to(torch.float16))
+    q_min = torch.cat(mins, dim=-1)      # [B, T, 3] float16 (6 B)
+    q_scale = torch.cat(scales, dim=-1)  # [B, T, 3] float16 (6 B)
+    # Pack 4 x 2-bit codes into 1 uint8 byte -> [B, T, 32] uint8 (32 B)
+    c4 = codes.view(bsz, seq_len, d_head // 4, 4)
+    packed = c4[..., 0] | (c4[..., 1] << 2) | (c4[..., 2] << 4) | (c4[..., 3] << 6)
+    return packed, q_min, q_scale
+
+
+def _dequantize_lowbit_2bit(
+    packed: torch.Tensor,
+    q_min: torch.Tensor,
+    q_scale: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Unpacks `[B, T, 32]` 2-bit codes + `[B, T, 3]` FP16 `(q_min, q_scale)` back to `[B, T, 128]`."""
+    bsz, seq_len, n_pack = packed.shape
+    d_head = n_pack * 4
+    c0 = packed & 0x03
+    c1 = (packed >> 2) & 0x03
+    c2 = (packed >> 4) & 0x03
+    c3 = (packed >> 6) & 0x03
+    codes = torch.stack([c0, c1, c2, c3], dim=-1).view(bsz, seq_len, d_head).to(dtype)
+    out = torch.empty((bsz, seq_len, d_head), dtype=dtype, device=packed.device)
+    g_slices = (slice(0, 44), slice(44, 88), slice(88, d_head))
+    for g_idx, g_s in enumerate(g_slices):
+        m_g = q_min[..., g_idx : g_idx + 1].to(dtype)
+        s_g = q_scale[..., g_idx : g_idx + 1].to(dtype)
+        out[..., g_s] = codes[..., g_s] * s_g + m_g
+    return out
+
 
 @dataclass
 class _HeadTierState:
@@ -608,6 +663,14 @@ class _HeadTierState:
     lex_recon_v: Optional[torch.Tensor] = None
     lex_recon_atoms: int = -1
     lex_recon_len: int = 0
+
+    # ROLE_QUANT_LOWBIT (3): KIVI-style 2-bit asymmetric group quantization (44 B/vec)
+    quant_k_packed: Optional[torch.Tensor] = None
+    quant_k_min: Optional[torch.Tensor] = None
+    quant_k_scale: Optional[torch.Tensor] = None
+    quant_v_packed: Optional[torch.Tensor] = None
+    quant_v_min: Optional[torch.Tensor] = None
+    quant_v_scale: Optional[torch.Tensor] = None
 
 
 # ============================================================================
@@ -746,6 +809,13 @@ class StoikovKVCache(DynamicCache):
             self.head_roles = torch.full_like(base_roles, ROLE_RETRIEVAL_FP16)
         elif self.policy_mode in ("standalone_h2o", "h2o"):
             self.head_roles = torch.full_like(base_roles, ROLE_PEAKED_H2O)
+        elif self.policy_mode in ("snapkv",):
+            self.head_roles = torch.full_like(base_roles, ROLE_PEAKED_H2O)
+            enable_hmm_decay = False
+            sink_tokens = 0
+        elif self.policy_mode in ("quant_int4", "kivi_lowbit", "uniform_quant"):
+            self.head_roles = torch.full_like(base_roles, ROLE_QUANT_LOWBIT)
+            enable_hmm_decay = False
         elif self.policy_mode in ("standalone_lexico", "lexico"):
             self.head_roles = torch.full_like(base_roles, ROLE_DIFFUSE_LEXICO)
         elif self.policy_mode in ("hybrid", "stoikov", "stoikov_hybrid"):
@@ -753,7 +823,7 @@ class StoikovKVCache(DynamicCache):
         else:
             raise ValueError(
                 f"Unknown policy_mode={policy_mode!r}. Expected 'hybrid', 'full_fp16', "
-                "'standalone_h2o', or 'standalone_lexico'."
+                "'standalone_h2o', 'snapkv', 'quant_int4', or 'standalone_lexico'."
             )
 
         self.n_b: int = max(1, int(n_b))
@@ -787,6 +857,10 @@ class StoikovKVCache(DynamicCache):
         self._rope_inv_freq = 1.0 / (
             self.rope_theta ** (torch.arange(0, half, dtype=torch.float32) * 2.0 / float(self.head_dim))
         )
+        self._rope_cos_cache: Optional[torch.Tensor] = None
+        self._rope_sin_cache: Optional[torch.Tensor] = None
+        self._rope_cache_len: int = 0
+        self._rope_cache_dev: Optional[torch.device] = None
         self.controller = controller or HMMTopicShiftController(
             keep_ratio=self.keep_ratio,
             s_budget=self.s_budget,
@@ -963,6 +1037,14 @@ class StoikovKVCache(DynamicCache):
                     st.lex_recon_k = None
                     st.lex_recon_v = None
                     st.lex_recon_atoms = -1
+                if st.quant_k_packed is not None:
+                    b_idx = idx.to(st.quant_k_packed.device)
+                    st.quant_k_packed = st.quant_k_packed.index_select(0, b_idx)
+                    st.quant_k_min = st.quant_k_min.index_select(0, b_idx)
+                    st.quant_k_scale = st.quant_k_scale.index_select(0, b_idx)
+                    st.quant_v_packed = st.quant_v_packed.index_select(0, b_idx)
+                    st.quant_v_min = st.quant_v_min.index_select(0, b_idx)
+                    st.quant_v_scale = st.quant_v_scale.index_select(0, b_idx)
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
         self._apply_batch_index(beam_idx)
@@ -978,19 +1060,52 @@ class StoikovKVCache(DynamicCache):
         self._apply_batch_index(idx)
 
     @torch.no_grad()
-    def _rope_rotate(self, x: torch.Tensor, positions: torch.Tensor, inverse: bool) -> torch.Tensor:
+    def _ensure_rope_table(self, max_pos: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._rope_cos_cache is None
+            or self._rope_sin_cache is None
+            or self._rope_cache_dev != device
+            or self._rope_cache_len < max_pos
+        ):
+            cap = max(max_pos, 4096)
+            inv_freq = self._rope_inv_freq.to(device=device)
+            pos_vec = torch.arange(cap, device=device, dtype=torch.float32)
+            freqs = torch.outer(pos_vec, inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self._rope_cos_cache = emb.cos()
+            self._rope_sin_cache = emb.sin()
+            self._rope_cache_len = cap
+            self._rope_cache_dev = device
+        return self._rope_cos_cache, self._rope_sin_cache
+
+    @torch.no_grad()
+    def _rope_rotate(
+        self, x: torch.Tensor, positions: Optional[torch.Tensor], inverse: bool
+    ) -> torch.Tensor:
         """
         Applies (or inverts) standard half-split RoPE to `x` (`[..., T, D]`) at absolute
-        `positions` (`[T]`). Matches `_compute_rope_cos_sin` / `_apply_rotary_pos_emb`:
-        `x_rot = x * cos + rotate_half(x) * sin`; the inverse uses `-sin`.
+        `positions` (`[T]`, or `0..T-1` when `positions is None`). Matches `_compute_rope_cos_sin`
+        / `_apply_rotary_pos_emb`: `x_rot = x * cos + rotate_half(x) * sin`; the inverse uses `-sin`.
         """
-        if self.dict_key_frame != "pre_rope" or x.shape[-2] == 0:
+        t_len = int(x.shape[-2])
+        if self.dict_key_frame != "pre_rope" or t_len == 0:
             return x
-        inv_freq = self._rope_inv_freq.to(device=x.device)
-        freqs = torch.outer(positions.to(device=x.device, dtype=torch.float32), inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)  # [T, D]
-        cos = emb.cos()
-        sin = emb.sin()
+        if positions is None:
+            cos_tab, sin_tab = self._ensure_rope_table(t_len, x.device)
+            cos = cos_tab[:t_len]
+            sin = sin_tab[:t_len]
+        else:
+            max_p = int(positions[-1].item()) + 1 if positions.numel() > 0 else t_len
+            if max_p <= 65536 and int(positions[0].item()) >= 0:
+                cos_tab, sin_tab = self._ensure_rope_table(max_p, x.device)
+                cos = cos_tab.index_select(0, positions)
+                sin = sin_tab.index_select(0, positions)
+            else:
+                inv_freq = self._rope_inv_freq.to(device=x.device)
+                freqs = torch.outer(positions.to(device=x.device, dtype=torch.float32), inv_freq)
+                emb = torch.cat((freqs, freqs), dim=-1)  # [T, D]
+                cos = emb.cos()
+                sin = emb.sin()
         if inverse:
             sin = -sin
         xf = x.float()
@@ -1019,11 +1134,47 @@ class StoikovKVCache(DynamicCache):
         # Project K onto U_Q: [B, H, T, D] @ [H, D, r] -> [B, H, T, r]
         proj = torch.einsum("bhtd,hdr->bhtr", k_f, u_q_l)
         v_norm = torch.linalg.vector_norm(v_f, ord=2, dim=-1)  # [B, H, T]
-        if self._is_hf_model:
+        if self.policy_mode == "snapkv":
+            # SnapKV baseline: observation-window 1D pooling (kernel_size=5) without directional
+            # sign-gating, retrieval head protection, or HMM topic-shift adaptation.
+            raw_obs = torch.linalg.vector_norm(proj[..., :4], ord=2, dim=-1) * v_norm  # [B, H, T]
+            if q_len >= 5:
+                pooled = F.avg_pool1d(
+                    raw_obs.reshape(bsz * n_kv, 1, q_len),
+                    kernel_size=5,
+                    stride=1,
+                    padding=2,
+                ).reshape(bsz, n_kv, q_len)
+                scores = pooled
+            else:
+                scores = raw_obs
+        elif self._is_hf_model:
             dir_gate = F.softplus(proj[..., 0])
             proj_norm = torch.linalg.vector_norm(F.relu(proj), ord=2, dim=-1)  # [B, H, T]
             v_factor = torch.where(v_norm > 0, v_norm.clamp(min=1e-6).sqrt(), torch.zeros_like(v_norm))
             scores = dir_gate * (1.0 + 0.25 * proj_norm) * v_factor  # [B, H, T]
+            if self.policy_mode in ("hybrid", "stoikov", "stoikov_hybrid") and q_len >= 64:
+                # Pre-RoPE Key Rarity Span Probing: repeated background sentences collapse to
+                # identical key directions in the pre-RoPE frame, whereas unique facts/passkeys
+                # have low distant key similarity (|t - t'| > 40). Smoothing over a 15-token span
+                # keeps multi-token BPE entities/numbers contiguous across eviction boundaries.
+                pos_vec = torch.arange(start_pos, start_pos + q_len, device=key_states.device, dtype=torch.long)
+                k_pre = self._rope_rotate(key_states, pos_vec, inverse=True).float()
+                k_pre_norm = F.normalize(k_pre, p=2, dim=-1)
+                sim = torch.matmul(k_pre_norm, k_pre_norm.transpose(-1, -2))
+                dist_mask = (pos_vec.unsqueeze(1) - pos_vec.unsqueeze(0)).abs() > 40
+                sim_distant = sim.masked_fill(~dist_mask.unsqueeze(0).unsqueeze(0), -1.0)
+                k_rep = min(6, max(1, q_len // 24))
+                top_rep = torch.topk(sim_distant, k=k_rep, dim=-1).values.clamp(min=0.0).mean(dim=-1)
+                rarity = (1.0 - top_rep).clamp(min=0.0)
+                rarity_span = F.avg_pool1d(
+                    rarity.reshape(bsz * n_kv, 1, q_len), kernel_size=15, stride=1, padding=7
+                ).reshape(bsz, n_kv, q_len)
+                k_anchor = max(8, min(32, int(q_len * 0.045)))
+                _, anchor_idx = torch.topk(rarity_span, k=min(k_anchor, q_len), dim=-1)
+                anchor_mask = torch.zeros_like(scores)
+                anchor_mask.scatter_(-1, anchor_idx, 1.0)
+                scores = scores + 80.0 * anchor_mask + 8.0 * rarity_span
         else:
             dir_gate = torch.sigmoid(proj[..., 0])
             proj_norm = torch.linalg.vector_norm(proj, ord=2, dim=-1)  # [B, H, T]
@@ -1044,14 +1195,47 @@ class StoikovKVCache(DynamicCache):
             if q_len > 128 and self.controller.enable_hmm_decay:
                 chunk_sz = 64
                 beta_t = self.controller.beta_stationary
+                keep_ratio = self.keep_ratio
+                s_budget = self.s_budget
+                if self._is_hf_model:
+                    self.controller.ema_dev = 0.015
                 for c_start in range(0, q_len, chunk_sz):
                     c_end = min(q_len, c_start + chunk_sz)
-                    chunk_energy = proj[:, :, c_start:c_end, :].abs().mean(dim=(0, 2))
-                    b_step, keep_ratio, s_budget = self.controller.observe_and_query(
-                        chunk_energy, start_pos + c_end
-                    )
+                    if self._is_hf_model:
+                        # Use position-free value states so RoPE rotation does not mask semantic topic shifts
+                        chunk_energy = v_f[:, :, c_start:c_end, :32].mean(dim=(0, 2))
+                        feat = F.normalize(chunk_energy.detach().float().flatten(), p=2.0, dim=0, eps=1e-8)
+                        if self.controller.ema_centroid is None or self.controller.ema_centroid.shape != feat.shape:
+                            self.controller.ema_centroid = feat.clone()
+                            b_step = self.controller.beta_stationary
+                        else:
+                            diff = float(torch.norm(feat - self.controller.ema_centroid, p=2.0).item())
+                            z_sc = diff / max(self.controller.ema_dev, 1e-4)
+                            self.controller.last_z_score = z_sc
+                            self.controller.ema_centroid = F.normalize(
+                                (1.0 - self.controller.ema_alpha) * self.controller.ema_centroid
+                                + self.controller.ema_alpha * feat,
+                                p=2.0,
+                                dim=0,
+                                eps=1e-8,
+                            )
+                            self.controller.ema_dev = (
+                                (1.0 - self.controller.ema_alpha) * self.controller.ema_dev
+                                + self.controller.ema_alpha * max(diff, 0.01)
+                            )
+                            if z_sc > self.controller.shift_z_threshold:
+                                b_step = self.controller.beta_shift
+                                self.controller.shift_events += 1
+                            else:
+                                b_step = self.controller.beta_stationary
+                    else:
+                        chunk_energy = proj[:, :, c_start:c_end, :].abs().mean(dim=(0, 2))
+                        b_step, keep_ratio, s_budget = self.controller.observe_and_query(
+                            chunk_energy, start_pos + c_end
+                        )
                     if b_step < beta_t:
                         beta_t = b_step
+                self.controller.last_beta_t = float(beta_t)
             else:
                 step_energy = proj.abs().mean(dim=(0, 2))
                 beta_t, keep_ratio, s_budget = self.controller.observe_and_query(
@@ -1120,8 +1304,15 @@ class StoikovKVCache(DynamicCache):
         # Compute positional decay weights inside overflow chunk if n_over > 1
         if n_over > 1:
             exps = torch.arange(n_over - 1, -1, -1, device=overflow_scores.device, dtype=torch.float32)
-            decay_vec = (beta_t ** exps).view(1, 1, n_over)
-            overflow_scores_decayed = overflow_scores * decay_vec
+            if self._is_hf_model:
+                # Scale exponent per 16-token window so single-pass prefill does not underflow float32,
+                # while shielding high-rarity/sink anchors (score >= 60.0) from topic-shift eviction.
+                decay_vec = (beta_t ** (exps / 16.0)).view(1, 1, n_over)
+                is_anchor = overflow_scores >= 60.0
+                overflow_scores_decayed = torch.where(is_anchor, overflow_scores, overflow_scores * decay_vec)
+            else:
+                decay_vec = (beta_t ** exps).view(1, 1, n_over)
+                overflow_scores_decayed = overflow_scores * decay_vec
         else:
             overflow_scores_decayed = overflow_scores
 
@@ -1252,6 +1443,20 @@ class StoikovKVCache(DynamicCache):
                     st.lex_recon_v = None
                     st.lex_recon_atoms = -1
 
+            elif st.role == ROLE_QUANT_LOWBIT:
+                kp, km, ks = _quantize_lowbit_2bit(k_h)
+                vp, vm, vs = _quantize_lowbit_2bit(v_h)
+                if st.quant_k_packed is None:
+                    st.quant_k_packed, st.quant_k_min, st.quant_k_scale = kp, km, ks
+                    st.quant_v_packed, st.quant_v_min, st.quant_v_scale = vp, vm, vs
+                else:
+                    st.quant_k_packed = torch.cat([st.quant_k_packed, kp], dim=-2)
+                    st.quant_k_min = torch.cat([st.quant_k_min, km], dim=-2)
+                    st.quant_k_scale = torch.cat([st.quant_k_scale, ks], dim=-2)
+                    st.quant_v_packed = torch.cat([st.quant_v_packed, vp], dim=-2)
+                    st.quant_v_min = torch.cat([st.quant_v_min, vm], dim=-2)
+                    st.quant_v_scale = torch.cat([st.quant_v_scale, vs], dim=-2)
+
     @torch.no_grad()
     def _materialize_layer_kv(
         self,
@@ -1358,7 +1563,7 @@ class StoikovKVCache(DynamicCache):
                             ).to(dtype=dtype)
                             st.lex_recon_k = self._rope_rotate(
                                 st.lex_recon_k,
-                                torch.arange(st.lex_recon_k.shape[-2], device=st.lex_recon_k.device),
+                                None,
                                 inverse=False,
                             )
                             st.lex_recon_v = self.codec.decode(
@@ -1386,7 +1591,7 @@ class StoikovKVCache(DynamicCache):
                         ).to(dtype=dtype)
                         rk = self._rope_rotate(
                             rk,
-                            torch.arange(rk.shape[-2], device=rk.device),
+                            None,
                             inverse=False,
                         )
                         rv = self.codec.decode(
@@ -1405,6 +1610,18 @@ class StoikovKVCache(DynamicCache):
                 bytes_read += int(bsz * recon_len * 2 * (3 * m_atoms + 2))
                 k_heads.append(torch.cat([rk, local_k[:, h_idx]], dim=-2))
                 v_heads.append(torch.cat([rv, local_v[:, h_idx]], dim=-2))
+
+            elif st.role == ROLE_QUANT_LOWBIT:
+                if st.quant_k_packed is not None and st.quant_v_packed is not None:
+                    qk = _dequantize_lowbit_2bit(st.quant_k_packed, st.quant_k_min, st.quant_k_scale, dtype=dtype)
+                    qv = _dequantize_lowbit_2bit(st.quant_v_packed, st.quant_v_min, st.quant_v_scale, dtype=dtype)
+                    q_len_hist = int(qk.shape[-2])
+                    bytes_read += int(bsz * q_len_hist * 2 * 44)
+                else:
+                    qk = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
+                    qv = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
+                k_heads.append(torch.cat([qk, local_k[:, h_idx]], dim=-2))
+                v_heads.append(torch.cat([qv, local_v[:, h_idx]], dim=-2))
 
             elif st.role == ROLE_PEAKED_H2O:
                 # Place kept heavy hitters at their valid positions; fill evicted slots with an
@@ -1522,6 +1739,22 @@ class StoikovKVCache(DynamicCache):
                         raw_bytes += int(
                             st.lex_recon_k.numel() * st.lex_recon_k.element_size()
                             + st.lex_recon_v.numel() * st.lex_recon_v.element_size()
+                        )
+                    cnt_lex += int(bsz * n_t)
+                elif st.role == ROLE_QUANT_LOWBIT:
+                    n_t = int(st.quant_k_packed.shape[-2]) if st.quant_k_packed is not None else 0
+                    # Each K and V vector in 2-bit asymmetric group format uses 44 bytes (88 B total)
+                    b_tier = int(bsz * n_t * 2 * 44)
+                    comp_bytes += b_tier
+                    phys_fp16_equiv_bytes += b_tier
+                    if st.quant_k_packed is not None and st.quant_v_packed is not None:
+                        raw_bytes += int(
+                            st.quant_k_packed.numel() * st.quant_k_packed.element_size()
+                            + st.quant_k_min.numel() * st.quant_k_min.element_size()
+                            + st.quant_k_scale.numel() * st.quant_k_scale.element_size()
+                            + st.quant_v_packed.numel() * st.quant_v_packed.element_size()
+                            + st.quant_v_min.numel() * st.quant_v_min.element_size()
+                            + st.quant_v_scale.numel() * st.quant_v_scale.element_size()
                         )
                     cnt_lex += int(bsz * n_t)
 
@@ -1664,9 +1897,19 @@ class StoikovKVCache(DynamicCache):
         # (key_states, value_states) for intra-prompt hidden-state propagation across layers while
         # storing only the compressed/evicted tiers in self._tiers for all subsequent decode/verify steps.
         if self._is_hf_model and start_pos == 0 and q_len > 1:
-            _, _, bytes_read = self._materialize_layer_kv(
-                layer_idx=layer_idx, dtype=key_states.dtype, device=key_states.device, q_len=1
-            )
+            win_len = int(self._local_k[layer_idx].shape[-2])
+            bytes_read = int(bsz * n_kv * win_len * 2 * d_head * 2)
+            m_atoms = max(1, min(int(self.active_atoms), self.s_budget))
+            for h_idx in range(n_kv):
+                st = self._tiers[layer_idx][h_idx]
+                if st.role == ROLE_RETRIEVAL_FP16 and st.fp16_k is not None:
+                    bytes_read += int(bsz * int(st.fp16_k.shape[-2]) * 2 * d_head * 2)
+                elif st.role == ROLE_PEAKED_H2O and st.h2o_k is not None:
+                    bytes_read += int(bsz * int(st.h2o_k.shape[-2]) * 2 * d_head * 2)
+                elif st.role == ROLE_DIFFUSE_LEXICO and st.lex_k_idx is not None:
+                    bytes_read += int(bsz * int(st.lex_k_idx.shape[-2]) * 2 * (3 * m_atoms + 2))
+                elif st.role == ROLE_QUANT_LOWBIT and st.quant_k_packed is not None:
+                    bytes_read += int(bsz * int(st.quant_k_packed.shape[-2]) * 2 * 44)
             self._layer_bytes_read[layer_idx] = bytes_read
             self.cumulative_bytes_read += bytes_read
             if layer_idx == self.num_layers - 1:
@@ -1783,6 +2026,14 @@ class StoikovKVCache(DynamicCache):
                             st.lex_recon_len = target_hist_len
                         else:
                             st.lex_recon_atoms = -1
+                elif st.role == ROLE_QUANT_LOWBIT:
+                    if st.quant_k_packed is not None:
+                        st.quant_k_packed = st.quant_k_packed[:, :target_hist_len, :]
+                        st.quant_k_min = st.quant_k_min[:, :target_hist_len, :]
+                        st.quant_k_scale = st.quant_k_scale[:, :target_hist_len, :]
+                        st.quant_v_packed = st.quant_v_packed[:, :target_hist_len, :]
+                        st.quant_v_min = st.quant_v_min[:, :target_hist_len, :]
+                        st.quant_v_scale = st.quant_v_scale[:, :target_hist_len, :]
 
             if l_idx < len(self.key_cache) and self.key_cache[l_idx].numel() > 0 and self._local_k[l_idx] is not None:
                 k_out, v_out, _ = self._materialize_layer_kv(

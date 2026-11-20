@@ -199,7 +199,13 @@ def predicted_memory_ratio(
     n_heads = n_layers * n_kv
     if policy_mode == "full_fp16":
         return 1.0
-    if policy_mode == "standalone_h2o":
+    vec = 4 * head_dim
+    win = min(n_b, seq_len)
+    hist = max(0, seq_len - win)
+    if policy_mode in ("quant_int4", "kivi_lowbit", "uniform_quant"):
+        num = n_heads * win * vec + n_heads * hist * 2 * 44
+        return float(num) / float(n_heads * seq_len * vec)
+    if policy_mode in ("standalone_h2o", "snapkv"):
         n_ret, n_h2o, n_lex = 0, n_heads, 0
     elif policy_mode == "standalone_lexico":
         n_ret, n_h2o, n_lex = 0, 0, n_heads
@@ -207,9 +213,6 @@ def predicted_memory_ratio(
         n_ret = int((head_roles == 0).sum().item())
         n_h2o = int((head_roles == 1).sum().item())
         n_lex = int((head_roles == 2).sum().item())
-    vec = 4 * head_dim
-    win = min(n_b, seq_len)
-    hist = max(0, seq_len - win)
     k_kept = min(max(1, int(seq_len * keep_ratio)), hist)
     num = (
         n_heads * win * vec
@@ -248,6 +251,8 @@ def solve_equal_budget_params(
     kr_grid = [i / 1000.0 for i in range(1000, 0, -1)]
     kr_h2o = next((kr for kr in kr_grid if ratio("standalone_h2o", kr, s_max) <= target_ratio), 0.001)
     out["standalone_h2o"] = {"keep_ratio": kr_h2o, "s_budget": s_max}
+    out["snapkv"] = {"keep_ratio": kr_h2o, "s_budget": s_max}
+    out["quant_int4"] = {"keep_ratio": 1.0, "s_budget": s_max}
 
     s_lex = next((s for s in range(s_max, 0, -1) if ratio("standalone_lexico", 1.0, s) <= target_ratio), 1)
     out["standalone_lexico"] = {"keep_ratio": 1.0, "s_budget": s_lex}
@@ -305,6 +310,24 @@ def evaluate_four_configs_2k(
         "short_name": "Standalone H2O",
         "policy_mode": "standalone_h2o",
         "keep_ratio": 0.17,
+        "s_budget": 16,
+        "n_b": 64,
+        "enable_hmm_decay": False,
+    },
+    {
+        "name": "SnapKV (20% Memory - Observation Window Pooling)",
+        "short_name": "SnapKV",
+        "policy_mode": "snapkv",
+        "keep_ratio": 0.17,
+        "s_budget": 16,
+        "n_b": 64,
+        "enable_hmm_decay": False,
+    },
+    {
+        "name": "Uniform Quant KIVI-2bit (20% Memory - All Heads Quantized)",
+        "short_name": "KIVI-2bit Quant",
+        "policy_mode": "quant_int4",
+        "keep_ratio": 1.0,
         "s_budget": 16,
         "n_b": 64,
         "enable_hmm_decay": False,

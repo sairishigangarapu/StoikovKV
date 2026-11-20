@@ -254,6 +254,8 @@ class ElasticLexicoCodec:
         self.lambda2 = float(ridge_lambda)
         self.device = self.D.device
         self.dtype = self.D.dtype
+        self._D_T_fp32 = self.D.transpose(1, 2).contiguous().to(torch.float32)
+        self._D_T_fp16 = self._D_T_fp32.to(torch.float16)
 
         if W_ridge is None:
             w_list = []
@@ -415,9 +417,21 @@ class ElasticLexicoCodec:
         self, indices: torch.Tensor, float_values: torch.Tensor, layer_idx: int
     ) -> torch.Tensor:
         """Vectorized reconstruction `sum_{j=1}^m values[..., j] * D[layer_idx, :, indices[..., j]]`."""
-        d_layer_t = self.D[layer_idx].transpose(0, 1).to(
-            device=float_values.device, dtype=float_values.dtype
-        )  # [n_atoms, head_dim]
+        if (
+            hasattr(self, "_D_T_fp32")
+            and self._D_T_fp32.device == float_values.device
+            and tuple(self._D_T_fp32.shape) == (self.num_layers, self.n_atoms, self.head_dim)
+        ):
+            if float_values.dtype == torch.float32:
+                d_layer_t = self._D_T_fp32[layer_idx]
+            elif float_values.dtype == torch.float16:
+                d_layer_t = self._D_T_fp16[layer_idx]
+            else:
+                d_layer_t = self._D_T_fp32[layer_idx].to(dtype=float_values.dtype)
+        else:
+            d_layer_t = self.D[layer_idx].transpose(0, 1).to(
+                device=float_values.device, dtype=float_values.dtype
+            )  # [n_atoms, head_dim]
         atoms = F.embedding(indices.to(torch.long), d_layer_t)  # [..., m, head_dim]
         return (atoms * float_values.unsqueeze(-1)).sum(dim=-2)  # [..., head_dim]
 

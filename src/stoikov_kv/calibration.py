@@ -2309,12 +2309,15 @@ def calibrate_model(
     head_roles = flat_roles.view(num_layers, num_kv_heads)
 
     if is_real_hf:
-        # Co-locate ROLE_DIFFUSE_LEXICO with ROLE_RETRIEVAL_FP16 layers on real HF models
-        # so every ROLE_PEAKED_H2O layer is layer-pure (`all_h2o == True`) and uses compact SDPA.
-        n_lex_target = int((head_roles == ROLE_DIFFUSE_LEXICO).sum().item())
+        # Co-locate ROLE_DIFFUSE_LEXICO onto the ROLE_RETRIEVAL_FP16 layers on real HF models
+        # so every other layer (25/28 = 89.3%) is layer-pure (`all_h2o == True`) and uses compact SDPA.
         ret_layers = [
             l_idx for l_idx in range(num_layers) if bool((head_roles[l_idx] == ROLE_RETRIEVAL_FP16).any().item())
         ]
+        n_lex_target = min(
+            int((head_roles == ROLE_DIFFUSE_LEXICO).sum().item()),
+            max(1, len(ret_layers)),
+        )
         non_ret_layers = [l_idx for l_idx in range(num_layers) if l_idx not in ret_layers]
         for l_idx in range(num_layers):
             for h_idx in range(num_kv_heads):
@@ -2323,17 +2326,13 @@ def calibrate_model(
         lex_assigned = 0
         for l_idx in ret_layers:
             for h_idx in range(num_kv_heads):
-                if head_roles[l_idx, h_idx] != ROLE_RETRIEVAL_FP16:
+                if head_roles[l_idx, h_idx] != ROLE_RETRIEVAL_FP16 and lex_assigned < n_lex_target:
                     head_roles[l_idx, h_idx] = ROLE_DIFFUSE_LEXICO
                     lex_assigned += 1
-        if lex_assigned < n_lex_target and non_ret_layers:
+        if lex_assigned == 0 and non_ret_layers:
             layer_ent = [(float(H_h[l_idx].float().mean().item()), l_idx) for l_idx in non_ret_layers]
             layer_ent.sort(key=lambda x: x[0], reverse=True)
-            for _, l_idx in layer_ent:
-                if lex_assigned >= n_lex_target:
-                    break
-                head_roles[l_idx, :] = ROLE_DIFFUSE_LEXICO
-                lex_assigned += num_kv_heads
+            head_roles[layer_ent[0][1], :] = ROLE_DIFFUSE_LEXICO
 
     # Validate all output tensors before saving
     for name, tensor in (
