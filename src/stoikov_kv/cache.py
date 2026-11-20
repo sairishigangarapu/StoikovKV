@@ -9,13 +9,14 @@ Implements:
   initializer (`U_Q`, `head_roles`, `D`, `W_ridge`, `head_entropy`) using only forward
   projection hooks (`output_attentions=False`), enabling immediate standalone execution
   when `calibrated_artifacts.pt` does not exist yet.
-- `HMMTopicShiftController`: Online non-stationary regime detector tracking write-time
-  query-subspace projection entropy EMA and variance; triggers rapid H2O score decay
-  (`beta_t = 0.65` vs stationary `beta_t = 0.98`) upon topic shifts (`z_score > 1.8`).
+- `HMMTopicShiftController`: Online non-stationary regime-change detector tracking EMA
+  centroid and deviation of subspace/value features; triggers rapid H2O score decay
+  (`beta_shift = 0.65` vs stationary `beta_stationary = 0.99`) upon topic shifts (`z_score > 1.4`).
 - `StoikovKVCache(DynamicCache)`: FlashAttention/SDPA-compatible hybrid KV cache with:
   1. Uncompressed FP16 sliding window of `n_b = 64` recent tokens across all KV heads.
-  2. Write-time importance probe `I_t = ||K_t @ U_Q||_2 * ||V_t||_2` + sink gate (`+100.0`
-     for token indices `0..3`) and decayed heavy-hitter value `V_i(t) = beta_t * V_i(t-1) + I_t`.
+  2. Write-time directional query-subspace importance probe (softplus-gated on pretrained
+     HuggingFace models; sigmoid-gated at unit scale) + sink gate (`+100.0` for token
+     indices `0..3`) and decayed heavy-hitter value `V_i(t) = beta_t * V_i(t-1) + I_t`.
   3. Per-KV-head routing for tokens older than `n_b = 64`:
      - `ROLE_RETRIEVAL_FP16 (0)`: Retain 100% of tokens in uncompressed FP16.
      - `ROLE_PEAKED_H2O (1)`: Evict lowest `V_i(t)` tokens, keeping only
@@ -1122,8 +1123,10 @@ class StoikovKVCache(DynamicCache):
         start_pos: int,
     ) -> Tuple[torch.Tensor, float, float, int]:
         """
-        Computes FlashAttention-compatible write-time score `I_t = ||K_t @ U_Q||_2 * ||V_t||_2`
-        (plus `+100.0` sink gate for global token indices `0..3`) and queries the controller.
+        Computes FlashAttention-compatible write-time directional probe score `I_t`
+        (softplus-gated on pretrained HuggingFace models; sigmoid-gated at unit scale,
+        plus `+100.0` sink gate for global token indices `0..3` and pre-RoPE rarity spans
+        during hybrid prefill) and queries the online regime-change decay controller.
         Never requires `output_attentions=True`.
         """
         bsz, n_kv, q_len, d_head = key_states.shape
@@ -1427,14 +1430,14 @@ class StoikovKVCache(DynamicCache):
                         k_val[..., : self.active_atoms],
                         layer_idx=layer_idx,
                         check_bounds=False,
-                    ).to(dtype=overflow_k.dtype)
+                    ).to(device=overflow_k.device, dtype=overflow_k.dtype)
                     rk = self._rope_rotate(rk, overflow_pos, inverse=False)
                     rv = self.codec.decode(
                         v_idx[..., : self.active_atoms],
                         v_val[..., : self.active_atoms],
                         layer_idx=layer_idx,
                         check_bounds=False,
-                    ).to(dtype=overflow_v.dtype)
+                    ).to(device=overflow_v.device, dtype=overflow_v.dtype)
                     st.lex_recon_k = torch.cat([st.lex_recon_k, rk], dim=-2)
                     st.lex_recon_v = torch.cat([st.lex_recon_v, rv], dim=-2)
                     st.lex_recon_len = int(st.lex_recon_k.shape[-2])
@@ -1560,7 +1563,7 @@ class StoikovKVCache(DynamicCache):
                                 st.lex_k_val[..., :m_atoms],
                                 layer_idx=layer_idx,
                                 check_bounds=False,
-                            ).to(dtype=dtype)
+                            ).to(device=device, dtype=dtype)
                             st.lex_recon_k = self._rope_rotate(
                                 st.lex_recon_k,
                                 None,
@@ -1571,7 +1574,7 @@ class StoikovKVCache(DynamicCache):
                                 st.lex_v_val[..., :m_atoms],
                                 layer_idx=layer_idx,
                                 check_bounds=False,
-                            ).to(dtype=dtype)
+                            ).to(device=device, dtype=dtype)
                             st.lex_recon_atoms = m_atoms
                             st.lex_recon_len = int(st.lex_recon_k.shape[-2])
                         else:
@@ -1588,7 +1591,7 @@ class StoikovKVCache(DynamicCache):
                             st.lex_k_val[..., :m_atoms],
                             layer_idx=layer_idx,
                             check_bounds=False,
-                        ).to(dtype=dtype)
+                        ).to(device=device, dtype=dtype)
                         rk = self._rope_rotate(
                             rk,
                             None,
@@ -1599,7 +1602,7 @@ class StoikovKVCache(DynamicCache):
                             st.lex_v_val[..., :m_atoms],
                             layer_idx=layer_idx,
                             check_bounds=False,
-                        ).to(dtype=dtype)
+                        ).to(device=device, dtype=dtype)
                         recon_len = int(rk.shape[-2])
                     else:
                         rk = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)

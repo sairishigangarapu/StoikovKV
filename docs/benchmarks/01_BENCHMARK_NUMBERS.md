@@ -14,6 +14,63 @@ This document consolidates the exact measured numbers across all StoikovKV bench
 
 ---
 
+## 0. Multi-Scale External Paul Graham Essays Audit (`bench_real_models_audit.py`)
+
+Evaluated directly on real pretrained HuggingFace weights (**`Qwen/Qwen2.5-1.5B-Instruct`**, **`Qwen/Qwen2.5-3B-Instruct`**, and **`Qwen/Qwen2.5-7B-Instruct`**) using strictly unseen 5-digit passkeys (disjoint from calibration code `"94812"`) planted inside independent essays from the external **Kamradt `LLMTest_NeedleInAHaystack` Paul Graham Essays** corpus (`50` essays, `8.3 MB`). All accuracies report exact numerators/denominators and **95% Wilson score confidence intervals**.
+
+### 0.1 Multi-Scale Held-Out Write-Time Subspace Probe (`1,440` Combined `(layer, prompt)` Pairs)
+
+| Real Pretrained Checkpoint | Placement / Calib Time | Held-Out Pairs | Sink-Aug. Probe $\rho$ (Mean $\pm$ SD) | Sink-Aug. Recall@20% | Raw Probe ($t \ge 4$) $\rho$ | Value-Norm ($\|V_t\|_2$) $\rho$ | Dict MSE / FP64 Residual |
+|---|---|---:|---:|---:|---:|---:|---|
+| **`Qwen/Qwen2.5-1.5B-Instruct`** | 100% GPU FP16 (`11.57 s`) | 336 | **0.5733 $\pm$ 0.2716** | **52.19% $\pm$ 18.09%** | **0.4020 $\pm$ 0.2887** | -0.0354 | `0.001545` / `7.31e-16` |
+| **`Qwen/Qwen2.5-3B-Instruct`** | 100% GPU FP16 (`15.59 s`) | 432 | **0.5655 $\pm$ 0.2456** | **52.64% $\pm$ 15.99%** | **0.3903 $\pm$ 0.2758** | -0.0031 | `0.001585` / `6.89e-16` |
+| **`Qwen/Qwen2.5-7B-Instruct`** | GPU=7/CPU=5/NVMe=16 (`85.88 s`) | 672 | **0.4838 $\pm$ 0.2908** | **49.72% $\pm$ 16.55%** | **0.3491 $\pm$ 0.3413** | +0.0043 | `0.001797` / `6.97e-16` |
+
+### 0.2 External Paul Graham Essays NIAH Across 1.5B, 3B, and 7B (Equalized $\sim 21\%$ KV Budget)
+
+| Model / Policy | `keep_ratio` / `s` | Hits / $N$ | Acc. (%) | 95% Wilson CI | KV Mem % | +Dict % | Next-Token Logit Cos | Decode (`tok/s`) |
+|---|---:|---:|---:|---|---:|---:|---:|---:|
+| *Real `Qwen/Qwen2.5-1.5B-Instruct` (100% GPU FP16, $N=20$ essays, $L \approx 1{,}024$, depths $\{10, 25, 50, 75\}\%$)* | | | | | | | | |
+| **Full FP16** | `1.000` / `16` | 20 / 20 | 100.0% | `[83.9%, 100.0%]` | 100.00% | 100.00% | 1.0000 | 17.76 |
+| **Standalone H2O** | `0.193` / `16` | 0 / 20 | 0.0% | `[0.0%, 16.1%]` | 21.93% | 21.93% | 0.8912 | 14.89 |
+| **SnapKV** | `0.193` / `16` | 12 / 20 | 60.0% | `[38.7%, 78.1%]` | 21.93% | 21.93% | 0.7973 | 16.28 |
+| **KIVI-2bit Quant** | `1.000` / `16` | 0 / 20 | 0.0% | `[0.0%, 16.1%]` | 19.89% | 19.89% | 0.5882 | 6.40 |
+| **Standalone Lexico** | `1.000` / `15` | 5 / 20 | 25.0% | `[11.2%, 46.9%]` | 21.03% | 27.56% | 0.8903 | 4.70 |
+| **StoikovKV Hybrid** | `0.144` / `12` | **17 / 20** | **85.0%** | **`[64.0%, 94.8%]`** | **21.56%** | **22.26%** | **0.9351** | **12.91** |
+| *Real `Qwen/Qwen2.5-3B-Instruct` (100% GPU FP16, $N=16$ essays, $L \approx 1{,}024$, depths $\{10, 25, 50, 75\}\%$)* | | | | | | | | |
+| **Full FP16** | `1.000` / `16` | 16 / 16 | 100.0% | `[80.6%, 100.0%]` | 100.00% | 100.00% | 1.0000 | 13.98 |
+| **Standalone H2O** | `0.188` / `16` | 0 / 16 | 0.0% | `[0.0%, 19.4%]` | 21.84% | 21.84% | 0.7749 | 11.81 |
+| **SnapKV** | `0.188` / `16` | 16 / 16 | 100.0% | `[80.6%, 100.0%]` | 21.84% | 21.84% | 0.7161 | 12.39 |
+| **KIVI-2bit Quant** | `1.000` / `16` | 1 / 16 | 6.2% | `[1.1%, 28.3%]` | 19.83% | 19.83% | 0.3159 | 4.93 |
+| **Standalone Lexico** | `1.000` / `15` | 5 / 16 | 31.2% | `[14.2%, 55.6%]` | 20.96% | 27.33% | 0.8441 | 3.24 |
+| **StoikovKV Hybrid** | `0.132` / `11` | **16 / 16** | **100.0%** | **`[80.6%, 100.0%]`** | **20.65%** | **21.35%** | **0.9371** | **9.92** |
+| *Real `Qwen/Qwen2.5-7B-Instruct` (GPU=7/CPU=5/NVMe=16 Offloaded FP16, $N=8$ essays, $L \approx 512$, depths $\{10, 25, 50, 75\}\%$)* | | | | | | | | |
+| **Full FP16** | `1.000` / `16` | 8 / 8 | 100.0% | `[67.6%, 100.0%]` | 100.00% | 100.00% | 1.0000 | 0.24 |
+| **Standalone H2O** | `0.158` / `16` | 0 / 8 | 0.0% | `[0.0%, 32.4%]` | 21.87% | 21.87% | 0.6985 | 0.24 |
+| **SnapKV** | `0.158` / `16` | 8 / 8 | 100.0% | `[67.6%, 100.0%]` | 21.78% | 21.78% | 0.7942 | 0.24 |
+| **StoikovKV Hybrid** | `0.106` / `9` | **8 / 8** | **100.0%** | **`[67.6%, 100.0%]`** | **20.75%** | **21.19%** | **0.8855** | **0.25** |
+
+### 0.3 `1,024` Strictly Distinct, Non-Tiled Real Paul Graham Prose KV Vectors (`Qwen2.5-1.5B` Layer 10)
+
+| Sparsity $s$ | Bytes / Vec (`3s+2`) | 1-Step Cosine | OMP Cosine | FISTA Cosine | 1-Step Enc (ms) | 1-Step Dec (ms) | OMP Enc (ms) | FISTA Enc (ms) | Speedup vs. OMP | Speedup vs. FISTA |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **4** | 14 B | 0.4677 | 0.4736 | 0.4718 | **1.896** | 0.198 | 16.812 | 10.419 | **8.87$\times$** | **5.50$\times$** |
+| **8** | 26 B | 0.5852 | 0.5921 | 0.5903 | **0.869** | 0.106 | 5.021 | 10.367 | **5.78$\times$** | **11.93$\times$** |
+| **12** | 38 B | 0.6609 | 0.6686 | 0.6667 | **0.847** | 0.105 | 6.492 | 10.257 | **7.67$\times$** | **12.11$\times$** |
+| **16** | 50 B | 0.7167 | 0.7249 | 0.7232 | **0.849** | 0.108 | 8.208 | 10.287 | **9.66$\times$** | **12.11$\times$** |
+| **32** | 98 B | 0.8488 | 0.8586 | 0.8572 | **0.877** | 0.160 | 32.959 | 11.643 | **37.58$\times$** | **13.27$\times$** |
+
+### 0.4 Strict Lossless Matryoshka Speculative Parity Audit (`strict_rejection_sampling=True`, Real `Qwen2.5-1.5B`)
+
+| Draft Atoms $m$ | Greedy Exact Parity | Greedy $\alpha$ / `tok/cyc` | Stochastic ($T=0.7$) Emp. $\alpha$ | Stochastic $\mathbb{E}[\alpha]$ | Stochastic `tok/cyc` | BW Saved vs. Full FP16 |
+|---:|---|---:|---:|---:|---:|---:|
+| **$m = 2$ (8 B)** | **32/32 (100.0%)** | `1.0000` / `4.71` | `0.9259` | `0.9574` | `4.12` | **66.34%** |
+| **$m = 4$ (14 B)** | **32/32 (100.0%)** | `1.0000` / `4.71` | `0.9630` | `0.9735` | `4.71` | **66.25%** |
+| **$m = 8$ (26 B)** | **32/32 (100.0%)** | `1.0000` / `4.71` | `0.9630` | `0.9856` | `4.71` | **66.07%** |
+| **$m = 12$ (38 B)** | **32/32 (100.0%)** | `1.0000` / `4.71` | `0.9630` | `0.9908` | `4.71` | **65.90%** |
+
+---
+
 ## 1. Pretrained `Qwen/Qwen2.5-1.5B-Instruct` End-to-End GPU Publication Suite (`bench_real_qwen_publication.py`)
 
 Evaluated directly on real HuggingFace `Qwen2ForCausalLM` pretrained weights (`Qwen/Qwen2.5-1.5B-Instruct`, `28` layers, `12` Q heads, `2` KV heads, `head_dim = 128`, `torch.float16` on `cuda:0`) with streaming $O(B \cdot T)$ calibration (`output_attentions=False`), pre-RoPE key rarity span probing, and SDPA compact mask slicing:

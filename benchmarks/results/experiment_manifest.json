@@ -1,0 +1,50 @@
+{
+  "generated_utc": "2026-11-20T20:23:21.128603+00:00",
+  "git_branch": "product-repo-layout",
+  "git_commit": "847776db3cb95f4bd136bd5d867794682a3df0b7",
+  "hardware": {
+    "os": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "pytorch": "2.12.0+cu130",
+    "cuda": "13.0",
+    "gpu_name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "gpu_vram_gb": 7.62
+  },
+  "pretrained_models": {
+    "Qwen/Qwen2.5-1.5B-Instruct": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+    "Qwen/Qwen2.5-3B-Instruct": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
+    "Qwen/Qwen2.5-7B-Instruct": "a09a35458c702b33eeacc393d103063234e8bc28"
+  },
+  "external_datasets": {
+    "paul_graham_essays_niah": {
+      "source": "gkamradt/LLMTest_NeedleInAHaystack (PaulGrahamEssays)",
+      "num_essays": 50,
+      "local_dir": "data/niah_external/paul_graham/needle-in-a-haystack-main/needlehaystack/PaulGrahamEssays"
+    },
+    "wikitext103": {
+      "source": "Salesforce/wikitext (wikitext-103-raw-v1)",
+      "local_dir": "data/wikitext/wikitext-103-raw-v1"
+    }
+  },
+  "source_sha256": {
+    "src/stoikov_kv/calibration.py": "c50e248ec57042ad2a5f22d6fb29c45f827e5ab95508408b7d0c9f9b5297a689",
+    "src/stoikov_kv/cache.py": "d646536d12c1fe42de1d164da5051ccc777790a023baf25382f2a70fb0ca446c",
+    "src/stoikov_kv/elastic_lexico.py": "fc72504100b3e7da825973d6295857afb5b3a9590af40a34bb95500724802008",
+    "src/stoikov_kv/matryoshka_spec.py": "0baa7217349f15ade6c2000077aadd2b998c2089a2145f9fefc817029047f867",
+    "benchmarks/bench_real_models_audit.py": "501dc548bff6c59155a68726797f4540f4b58edbda19a4f745023e62b222cbc3",
+    "benchmarks/bench_real_qwen_publication.py": "7142ada28f989783f7477c4bcb5b1b517a0d4c501b6476734c96f805eacc7cf5",
+    "benchmarks/bench_cache_ablation.py": "4f39acec0dd984a1c29cb3d0d552ae799c7473eef944f4fabfd012f1723d7b0c",
+    "benchmarks/bench_calibration_codec.py": "fccf01e42b5f19bb5468af343cca1a4fd9cee9c0ac2d8ecec4f8617e841ca753"
+  },
+  "result_json_sha256": {
+    "benchmarks/results/cache_ablation_results.json": "f9100755629f31e4dd8f125874e2facc32bccdd5095d1436248d794100397dd8",
+    "benchmarks/results/calibration_codec_metrics.json": "ff3937469dcb74936d02c93088822dc0d754559dc0bc6e7d42437db17c2a2769",
+    "benchmarks/results/eval_results.json": "ad689a33500a42a7f6bf5d0d7e5347cbebb252d03c5065fbc932be3be7f2c40f",
+    "benchmarks/results/person1_metrics.json": "2ae26d3e4bad11c1c7f3a34f93bbf6b1d4c7177289d4bceb9d8121ecd37a2dab",
+    "benchmarks/results/real_qwen15b_gpu_metrics.json": "3051f83615a8914e3873c74bd9f04e6d794d4fc46ebc3fc7941f2b0c90feed38",
+    "benchmarks/results/real_qwen15b_publication_suite.json": "dcac50f192f5f99ae1efa003769deddd41fc809f4be5e61cbb84cb6df3fa6fa9",
+    "benchmarks/results/real_qwen_1.5b_paul_graham_audit_results.json": "be945914d875b2e9387d460620ff1605630044e18f2c5db76fde767f1a125e40",
+    "benchmarks/results/real_qwen_3b_paul_graham_audit_results.json": "a8f8b894ec5da51817dc4195f625fe015b61595c285c06392d4fe2f8b24b5e87",
+    "benchmarks/results/real_qwen_7b_paul_graham_audit_results.json": "fd8d30f9225545b8f4902bf69d80284951ac192a5281a0fa3141fe4b64713807"
+  }
+}

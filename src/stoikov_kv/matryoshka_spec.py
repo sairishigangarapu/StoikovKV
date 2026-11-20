@@ -87,20 +87,27 @@ def _logits_to_probs(
     temperature: float = 0.6,
     top_k: int = 32,
     suppress_ids: Optional[List[int]] = None,
+    strict: bool = True,
 ) -> torch.Tensor:
     """
     Converts raw logits `[..., vocab_size]` into a normalized top-k probability distribution
     in `float32` so both draft (`q_probs`) and target (`p_probs`) share identical support
     and temperature scaling.
+    When `strict=True`, applies exact standard temperature scaling `logits / temperature`
+    and top-k truncation with zero heuristic suppression (distribution-preserving).
     """
     logits_f = logits.float().clone()
-    if suppress_ids:
-        valid_sup = [idx for idx in suppress_ids if 0 <= idx < logits_f.shape[-1]]
-        if valid_sup:
-            logits_f[..., valid_sup] -= 2.5
-    std = logits_f.std(dim=-1, keepdim=True).clamp_min(1e-5)
-    eff_temp = max(float(temperature), 0.05) * std * 0.055
-    scaled = logits_f / eff_temp
+    if strict:
+        temp = max(float(temperature), 1e-5)
+        scaled = logits_f / temp
+    else:
+        if suppress_ids:
+            valid_sup = [idx for idx in suppress_ids if 0 <= idx < logits_f.shape[-1]]
+            if valid_sup:
+                logits_f[..., valid_sup] -= 2.5
+        std = logits_f.std(dim=-1, keepdim=True).clamp_min(1e-5)
+        eff_temp = max(float(temperature), 0.05) * std * 0.055
+        scaled = logits_f / eff_temp
     if top_k > 0 and top_k < scaled.shape[-1]:
         top_vals, top_idx = torch.topk(scaled, k=top_k, dim=-1)
         filtered = torch.full_like(scaled, float("-inf"))
@@ -123,7 +130,7 @@ def matryoshka_speculative_generate(
     temperature: float = 0.5,
     top_k: int = 32,
     seed: int = 42,
-    strict_rejection_sampling: bool = False,
+    strict_rejection_sampling: bool = True,
     do_sample: bool = False,
 ) -> MatryoshkaSpecResult:
     """
@@ -249,9 +256,18 @@ def matryoshka_speculative_generate(
                 decode_bytes_read_total += int(cache.cumulative_bytes_read - bytes_before)
 
                 sup_step = recent_sup + [int(step_inp.item())] + [int(t.item()) for t in draft_ids]
-                logits_q = _contextual_logits(model, _extract_logits(out_q), step_inp)[:, -1, :]  # [1, vocab_size]
+                raw_q = _extract_logits(out_q)
+                logits_q = (
+                    raw_q[:, -1, :]
+                    if strict_rejection_sampling
+                    else _contextual_logits(model, raw_q, step_inp)[:, -1, :]
+                )  # [1, vocab_size]
                 q_dist = _logits_to_probs(
-                    logits_q, temperature=temperature, top_k=top_k, suppress_ids=sup_step
+                    logits_q,
+                    temperature=temperature,
+                    top_k=top_k,
+                    suppress_ids=None if strict_rejection_sampling else sup_step,
+                    strict=strict_rejection_sampling,
                 )  # [1, V]
                 if strict_rejection_sampling and do_sample and temperature > 0.0:
                     cand_cpu = torch.multinomial(q_dist.cpu(), num_samples=1, generator=gen)
@@ -285,7 +301,12 @@ def matryoshka_speculative_generate(
             decode_bytes_read_total += verify_step_bytes
             verify_passes += 1
 
-            logits_p_all = _contextual_logits(model, _extract_logits(out_p), verify_inp)  # [1, cur_gamma + 1, vocab_size]
+            raw_p = _extract_logits(out_p)
+            logits_p_all = (
+                raw_p
+                if strict_rejection_sampling
+                else _contextual_logits(model, raw_p, verify_inp)
+            )  # [1, cur_gamma + 1, vocab_size]
             p_probs_list: List[torch.Tensor] = []
             for j in range(cur_gamma):
                 sup_step_p = recent_sup + [int(verify_inp[0, j].item())] + [
@@ -296,7 +317,8 @@ def matryoshka_speculative_generate(
                         logits_p_all[0, j : j + 1],
                         temperature=temperature,
                         top_k=top_k,
-                        suppress_ids=sup_step_p,
+                        suppress_ids=None if strict_rejection_sampling else sup_step_p,
+                        strict=strict_rejection_sampling,
                     )[0]
                 )
 
@@ -381,7 +403,8 @@ def matryoshka_speculative_generate(
                         logits_p_all[0, cur_gamma : cur_gamma + 1],
                         temperature=temperature,
                         top_k=top_k,
-                        suppress_ids=sup_bonus,
+                        suppress_ids=None if strict_rejection_sampling else sup_bonus,
+                        strict=strict_rejection_sampling,
                     )[0]
                     if strict_rejection_sampling and do_sample and temperature > 0.0:
                         bonus_tok = int(torch.multinomial(p_bonus.cpu(), num_samples=1, generator=gen).item())

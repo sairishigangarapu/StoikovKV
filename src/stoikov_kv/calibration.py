@@ -2087,9 +2087,9 @@ def calibrate_model(
                     total_entropy_prompts += 1
 
                 for l_idx in range(num_layers):
-                    q_pre = current_q[l_idx]
-                    k_pre = current_k[l_idx]
-                    v_t = current_v[l_idx]
+                    q_pre = current_q[l_idx].to(device=device, dtype=model_dtype)
+                    k_pre = current_k[l_idx].to(device=device, dtype=model_dtype)
+                    v_t = current_v[l_idx].to(device=device, dtype=model_dtype)
 
                     # Apply consistent RoPE to Q and K so U_Q and K share the exact post-RoPE inner-product frame
                     q_rope, k_rope = _apply_rotary_pos_emb(q_pre, k_pre, cos, sin)
@@ -2104,28 +2104,28 @@ def calibrate_model(
                     )
 
                     if split_tag in ("calib", "needle"):
-                        calib_Q[l_idx].append(q_rope)
-                        calib_K[l_idx].append(k_rope)
-                        calib_K_pre[l_idx].append(k_pre)
-                        calib_V[l_idx].append(v_t)
-                        entropy_accum[l_idx] += stats["kv_ent"]
+                        calib_Q[l_idx].append(q_rope.cpu())
+                        calib_K[l_idx].append(k_rope.cpu())
+                        calib_K_pre[l_idx].append(k_pre.cpu())
+                        calib_V[l_idx].append(v_t.cpu())
+                        entropy_accum[l_idx] += stats["kv_ent"].to(device)
                     else:
-                        heldout_K[l_idx].append(k_rope)
-                        heldout_V[l_idx].append(v_t)
-                        heldout_ref_norm[l_idx].append(stats["ref_norm"])
-                        heldout_ref_cum[l_idx].append(stats["ref_cum"])
+                        heldout_K[l_idx].append(k_rope.cpu())
+                        heldout_V[l_idx].append(v_t.cpu())
+                        heldout_ref_norm[l_idx].append(stats["ref_norm"].cpu())
+                        heldout_ref_cum[l_idx].append(stats["ref_cum"].cpu())
 
                     if is_needle_prompt and needle_indices and stats["kv_copy"] is not None:
                         if split_tag in ("calib", "needle"):
-                            retrieval_accum[l_idx] += stats["kv_copy"]
+                            retrieval_accum[l_idx] += stats["kv_copy"].to(device)
                         else:
-                            heldout_retrieval_accum[l_idx] += stats["kv_copy"]
+                            heldout_retrieval_accum[l_idx] += stats["kv_copy"].to(device)
 
                         if distractor_indices and stats["kv_dist"] is not None:
                             if split_tag in ("calib", "needle"):
-                                distractor_accum[l_idx] += stats["kv_dist"]
+                                distractor_accum[l_idx] += stats["kv_dist"].to(device)
                             else:
-                                heldout_distractor_accum[l_idx] += stats["kv_dist"]
+                                heldout_distractor_accum[l_idx] += stats["kv_dist"].to(device)
 
                 del outputs
     finally:
@@ -2177,7 +2177,7 @@ def calibrate_model(
     for l_idx in range(num_layers):
         # 2. Query Subspace Basis (U_Q) from calibration Q states only:
         # Reshape Q per KV head group: [num_kv_heads, N_tokens * q_per_kv, head_dim]
-        q_cat = torch.cat(calib_Q[l_idx], dim=2)  # [1, num_q_heads, N_tokens, head_dim]
+        q_cat = torch.cat(calib_Q[l_idx], dim=2).to(device=device)  # [1, num_q_heads, N_tokens, head_dim]
         n_tokens_total = q_cat.shape[2]
         q_grouped = (
             q_cat.view(1, num_kv_heads, q_per_kv, n_tokens_total, head_dim)
@@ -2207,9 +2207,9 @@ def calibrate_model(
         U_Q[l_idx] = u_q_layer.to(model_dtype)
 
         # 3. Evaluate Write-Time Probe on Held-Out Evaluation Prompts
-        eval_K_layer = heldout_K[l_idx] if heldout_K[l_idx] else calib_K[l_idx]
-        eval_V_layer = heldout_V[l_idx] if heldout_V[l_idx] else calib_V[l_idx]
-        eval_ref_layer = heldout_ref_norm[l_idx]
+        eval_K_layer = [t.to(device) for t in (heldout_K[l_idx] if heldout_K[l_idx] else calib_K[l_idx])]
+        eval_V_layer = [t.to(device) for t in (heldout_V[l_idx] if heldout_V[l_idx] else calib_V[l_idx])]
+        eval_ref_layer = [t.to(device) for t in heldout_ref_norm[l_idx]]
 
         probe_eval = evaluate_write_time_probe(
             K_list=eval_K_layer,
@@ -2224,10 +2224,11 @@ def calibrate_model(
         )
         # Also evaluate sink-augmented probe against cumulative (unnormalized) attention reference
         if heldout_ref_cum[l_idx]:
+            eval_ref_cum_layer = [t.to(device) for t in heldout_ref_cum[l_idx]]
             probe_eval_cum = evaluate_write_time_probe(
                 K_list=eval_K_layer,
                 V_list=eval_V_layer,
-                attn_or_ref_list=heldout_ref_cum[l_idx],
+                attn_or_ref_list=eval_ref_cum_layer,
                 U_Q_layer=u_q_layer,
                 num_kv_heads=num_kv_heads,
                 q_per_kv=q_per_kv,
@@ -2251,8 +2252,8 @@ def calibrate_model(
             sample_probe_data = probe_eval
 
         # 5. Train Universal Dictionary D ([head_dim, dict_atoms]) & W_ridge ([dict_atoms, head_dim])
-        k_cat = torch.cat(calib_K_pre[l_idx], dim=2).reshape(-1, head_dim)
-        v_cat = torch.cat(calib_V[l_idx], dim=2).reshape(-1, head_dim)
+        k_cat = torch.cat(calib_K_pre[l_idx], dim=2).reshape(-1, head_dim).to(device=device)
+        v_cat = torch.cat(calib_V[l_idx], dim=2).reshape(-1, head_dim).to(device=device)
         kv_pool = torch.cat([k_cat, v_cat], dim=0)
 
         D_layer, W_ridge_layer, d_stats = _train_layer_dictionary(
@@ -2267,6 +2268,16 @@ def calibrate_model(
         W_ridge_all[l_idx] = W_ridge_layer.to(model_dtype)
         dict_mses.append(d_stats["rec_mse"])
         solve_residuals.append(d_stats["solve_rel_residual"])
+
+        # Release per-layer CPU calibration buffers immediately to keep RAM bounded on 7B+ models
+        calib_Q[l_idx].clear()
+        calib_K[l_idx].clear()
+        calib_K_pre[l_idx].clear()
+        calib_V[l_idx].clear()
+        heldout_K[l_idx].clear()
+        heldout_V[l_idx].clear()
+        heldout_ref_norm[l_idx].clear()
+        heldout_ref_cum[l_idx].clear()
 
     # Step 4: Deterministic Head Role Classification with Minimum Evidence Check
     total_heads = num_layers * num_kv_heads

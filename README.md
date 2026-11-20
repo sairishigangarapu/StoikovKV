@@ -55,7 +55,7 @@
 ## Architecture Overview
 
 1. **Offline Streaming Calibration (`stoikov_kv.calibration`):**
-   - Extracts a rank-$r$ ($r = 16$) orthonormal query subspace basis $U_Q \in \mathbb{R}^{L \times H_{kv} \times d \times r}$ per KV head group with column `0` anchored to the normalized mean query direction $\hat{\mu}_Q$, running in $O(B \cdot T)$ memory with `output_attentions=False`.
+   - Extracts a rank-$r$ ($r = 16$) orthonormal query subspace basis $U_Q \in \mathbb{R}^{L \times H_{kv} \times d \times r}$ per KV head group via regularized uncentered eigendecomposition ($Q^\top Q + 0.1 I_d$) sign-aligned against $\bar{Q}$ ($\bar{Q} U_Q \ge 0$), running in $O(B \cdot T)$ streaming hook memory with `output_attentions=False`.
    - Scores incoming tokens at write time without materializing the $O(T^2)$ attention matrix:
      $$I_t = \phi\!\left((K_t U_Q)_0\right) \cdot \|K_t U_Q\|_2 \cdot \psi\!\left(\|V_t\|_2\right)$$
    - Classifies each KV head into one of three tiers:
