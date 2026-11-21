@@ -1,7 +1,7 @@
 {
-  "generated_utc": "2026-11-20T20:23:21.128603+00:00",
+  "generated_utc": "2026-11-21T05:25:55.060896+00:00",
   "git_branch": "product-repo-layout",
-  "git_commit": "847776db3cb95f4bd136bd5d867794682a3df0b7",
+  "git_commit": "04b099c17d43b53d4b7a0dc6d29f62ef12c67274",
   "hardware": {
     "os": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
     "python": "3.12.3",
@@ -32,6 +32,8 @@
     "src/stoikov_kv/elastic_lexico.py": "fc72504100b3e7da825973d6295857afb5b3a9590af40a34bb95500724802008",
     "src/stoikov_kv/matryoshka_spec.py": "0baa7217349f15ade6c2000077aadd2b998c2089a2145f9fefc817029047f867",
     "benchmarks/bench_real_models_audit.py": "501dc548bff6c59155a68726797f4540f4b58edbda19a4f745023e62b222cbc3",
+    "benchmarks/audit_speculative_distribution.py": "1c28c995cf6a7c6f88d8e823c43167c03713f3743414b017933131346647b35b",
+    "benchmarks/extend_7b_niah_16.py": "e4bee59db6c71d9df45c1f6841ded5638f12a76e722cb60f19aa6eeb92b8ad34",
     "benchmarks/bench_real_qwen_publication.py": "7142ada28f989783f7477c4bcb5b1b517a0d4c501b6476734c96f805eacc7cf5",
     "benchmarks/bench_cache_ablation.py": "4f39acec0dd984a1c29cb3d0d552ae799c7473eef944f4fabfd012f1723d7b0c",
     "benchmarks/bench_calibration_codec.py": "fccf01e42b5f19bb5468af343cca1a4fd9cee9c0ac2d8ecec4f8617e841ca753"
@@ -45,6 +47,7 @@
     "benchmarks/results/real_qwen15b_publication_suite.json": "dcac50f192f5f99ae1efa003769deddd41fc809f4be5e61cbb84cb6df3fa6fa9",
     "benchmarks/results/real_qwen_1.5b_paul_graham_audit_results.json": "be945914d875b2e9387d460620ff1605630044e18f2c5db76fde767f1a125e40",
     "benchmarks/results/real_qwen_3b_paul_graham_audit_results.json": "a8f8b894ec5da51817dc4195f625fe015b61595c285c06392d4fe2f8b24b5e87",
-    "benchmarks/results/real_qwen_7b_paul_graham_audit_results.json": "fd8d30f9225545b8f4902bf69d80284951ac192a5281a0fa3141fe4b64713807"
+    "benchmarks/results/real_qwen_7b_paul_graham_audit_results.json": "00e68dc8e9d83e029c37dc21def7314c8f0eb65ef109843970ea5fb256cfa6bc",
+    "benchmarks/results/speculative_distributional_equivalence_audit.json": "a70cc264920d8be56ce36fd6a99dfc846cffb2eb66cb636d4698e7e4b642916d"
   }
 }

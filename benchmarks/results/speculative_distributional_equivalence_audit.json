@@ -1,0 +1,66 @@
+{
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "temperature": 1.0,
+  "top_k": 32,
+  "n_monte_carlo_draws": 10000,
+  "target_entropy_nats": 1.8811,
+  "reference_iid_tvd": 0.0128,
+  "results": [
+    {
+      "draft_atoms_m": 2,
+      "verify_atoms_s": 16,
+      "logit_l2_diff": 26.0015,
+      "analytical_tvd_q_vs_p": 0.0443,
+      "analytical_marginal_tvd_err": 2.95e-17,
+      "expected_acceptance_alpha": 0.9557,
+      "empirical_acceptance_alpha": 0.9539,
+      "empirical_tvd_spec_vs_p": 0.0129,
+      "reference_iid_tvd": 0.0128,
+      "chi2_stat": 19.83,
+      "chi2_df": 16,
+      "chi2_p_value": 0.228
+    },
+    {
+      "draft_atoms_m": 4,
+      "verify_atoms_s": 16,
+      "logit_l2_diff": 16.9845,
+      "analytical_tvd_q_vs_p": 0.0268,
+      "analytical_marginal_tvd_err": 3.03e-17,
+      "expected_acceptance_alpha": 0.9732,
+      "empirical_acceptance_alpha": 0.9721,
+      "empirical_tvd_spec_vs_p": 0.0096,
+      "reference_iid_tvd": 0.0128,
+      "chi2_stat": 15.58,
+      "chi2_df": 16,
+      "chi2_p_value": 0.4823
+    },
+    {
+      "draft_atoms_m": 8,
+      "verify_atoms_s": 16,
+      "logit_l2_diff": 8.9344,
+      "analytical_tvd_q_vs_p": 0.0085,
+      "analytical_marginal_tvd_err": 6.25e-17,
+      "expected_acceptance_alpha": 0.9915,
+      "empirical_acceptance_alpha": 0.9914,
+      "empirical_tvd_spec_vs_p": 0.008,
+      "reference_iid_tvd": 0.0128,
+      "chi2_stat": 4.4,
+      "chi2_df": 16,
+      "chi2_p_value": 0.998
+    },
+    {
+      "draft_atoms_m": 12,
+      "verify_atoms_s": 16,
+      "logit_l2_diff": 4.5336,
+      "analytical_tvd_q_vs_p": 0.0039,
+      "analytical_marginal_tvd_err": 2.83e-17,
+      "expected_acceptance_alpha": 0.9961,
+      "empirical_acceptance_alpha": 0.9957,
+      "empirical_tvd_spec_vs_p": 0.011,
+      "reference_iid_tvd": 0.0128,
+      "chi2_stat": 22.5,
+      "chi2_df": 16,
+      "chi2_p_value": 0.1279
+    }
+  ]
+}

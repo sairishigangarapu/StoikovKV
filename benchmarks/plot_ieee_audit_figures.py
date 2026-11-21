@@ -190,7 +190,7 @@ def plot_niah_pareto(d15: dict, d3: dict, d7: dict | None, root: Path) -> None:
 
     # Left: Paul Graham Essays NIAH accuracy with Wilson 95% CIs across models
     policies = ["Full FP16", "StoikovKV Hybrid", "SnapKV", "Standalone Lexico", "Standalone H2O", "KIVI-2bit Quant"]
-    short_labels = ["Full\nFP16", "StoikovKV\nHybrid", "SnapKV", "Lexico\nOnly", "H2O\nOnly", "KIVI\n2-bit"]
+    short_labels = ["Full\nFP16", "StoikovKV\nHybrid", "SnapKV", "Lexico\nOnly", "H2O\nOnly", "2-bit\nQuant"]
     x = np.arange(len(policies))
 
     def _extract(d: dict, pols: list[str]):
@@ -214,11 +214,12 @@ def plot_niah_pareto(d15: dict, d3: dict, d7: dict | None, root: Path) -> None:
 
     if d7 is not None:
         v7, e7 = _extract(d7, policies)
+        n7_trials = int(d7["niah_results"]["Full FP16"]["n_trials"])
         w = 0.25
         ax1.bar(x - w, v15, w, yerr=e15, capsize=2.5, label="Qwen2.5-1.5B (n=20)", color="#0284C7", edgecolor="#0369A1", error_kw={"lw": 0.9})
         ax1.bar(x, v3, w, yerr=e3, capsize=2.5, label="Qwen2.5-3B (n=16)", color="#059669", edgecolor="#047857", error_kw={"lw": 0.9})
         valid7 = ~np.isnan(v7)
-        ax1.bar(x[valid7] + w, v7[valid7], w, yerr=e7[:, valid7], capsize=2.5, label="Qwen2.5-7B (n=8)", color="#D97706", edgecolor="#B45309", error_kw={"lw": 0.9})
+        ax1.bar(x[valid7] + w, v7[valid7], w, yerr=e7[:, valid7], capsize=2.5, label=f"Qwen2.5-7B (n={n7_trials})", color="#D97706", edgecolor="#B45309", error_kw={"lw": 0.9})
     else:
         w = 0.34
         ax1.bar(x - w / 2, v15, w, yerr=e15, capsize=3, label="Qwen2.5-1.5B (n=20)", color="#0284C7", edgecolor="#0369A1")
@@ -254,7 +255,8 @@ def plot_niah_pareto(d15: dict, d3: dict, d7: dict | None, root: Path) -> None:
         c, mk, sz = style_map[p]
         ax2.scatter(r["next_token_logit_cosine"], r["accuracy_pct"], color=c, marker=mk, s=sz, edgecolor="#0F172A", linewidth=0.7, zorder=4)
         dx, dy = offsets_3b[p]
-        lbl = f"{p}\n({r['kv_mem_pct']:.0f}% KV)" if p != "Full FP16" else "Full FP16\n(100% KV)"
+        disp_name = "2-bit Quant (KIVI-style)" if p == "KIVI-2bit Quant" else p
+        lbl = f"{disp_name}\n({r['kv_mem_pct']:.0f}% KV)" if p != "Full FP16" else "Full FP16\n(100% KV)"
         ap = dict(arrowstyle="-", color=c, lw=0.8) if p in ("StoikovKV Hybrid", "Full FP16", "SnapKV") else None
         ax2.annotate(
             lbl,

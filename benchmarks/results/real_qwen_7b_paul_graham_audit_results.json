@@ -2982,88 +2982,88 @@
       "policy_mode": "full_fp16",
       "keep_ratio": 1.0,
       "s_budget": 16,
-      "hits": 8,
-      "n_trials": 8,
+      "hits": 16,
+      "n_trials": 16,
       "accuracy_pct": 100.0,
       "wilson_95_ci_pct": [
-        67.6,
+        80.6,
         100.0
       ],
       "accuracy_by_depth": {
-        "10%": "2/2 (100%)",
-        "25%": "2/2 (100%)",
-        "50%": "2/2 (100%)",
-        "75%": "2/2 (100%)"
+        "10%": "4/4 (100%)",
+        "25%": "4/4 (100%)",
+        "50%": "4/4 (100%)",
+        "75%": "4/4 (100%)"
       },
       "kv_mem_pct": 100.0,
       "total_mem_incl_dict_pct": 100.0,
       "next_token_logit_cosine": 1.0,
-      "decode_tok_per_s": 0.24
+      "decode_tok_per_s": 0.23
     },
     "Standalone H2O": {
       "policy_mode": "standalone_h2o",
       "keep_ratio": 0.158,
       "s_budget": 16,
       "hits": 0,
-      "n_trials": 8,
+      "n_trials": 16,
       "accuracy_pct": 0.0,
       "wilson_95_ci_pct": [
         0.0,
-        32.4
+        19.4
       ],
       "accuracy_by_depth": {
-        "10%": "0/2 (0%)",
-        "25%": "0/2 (0%)",
-        "50%": "0/2 (0%)",
-        "75%": "0/2 (0%)"
+        "10%": "0/4 (0%)",
+        "25%": "0/4 (0%)",
+        "50%": "0/4 (0%)",
+        "75%": "0/4 (0%)"
       },
       "kv_mem_pct": 21.87,
       "total_mem_incl_dict_pct": 21.87,
-      "next_token_logit_cosine": 0.6985,
+      "next_token_logit_cosine": 0.7488,
       "decode_tok_per_s": 0.24
     },
     "SnapKV": {
       "policy_mode": "snapkv",
       "keep_ratio": 0.158,
       "s_budget": 16,
-      "hits": 8,
-      "n_trials": 8,
+      "hits": 16,
+      "n_trials": 16,
       "accuracy_pct": 100.0,
       "wilson_95_ci_pct": [
-        67.6,
+        80.6,
         100.0
       ],
       "accuracy_by_depth": {
-        "10%": "2/2 (100%)",
-        "25%": "2/2 (100%)",
-        "50%": "2/2 (100%)",
-        "75%": "2/2 (100%)"
+        "10%": "4/4 (100%)",
+        "25%": "4/4 (100%)",
+        "50%": "4/4 (100%)",
+        "75%": "4/4 (100%)"
       },
       "kv_mem_pct": 21.78,
       "total_mem_incl_dict_pct": 21.78,
-      "next_token_logit_cosine": 0.7942,
-      "decode_tok_per_s": 0.24
+      "next_token_logit_cosine": 0.7729,
+      "decode_tok_per_s": 0.23
     },
     "StoikovKV Hybrid": {
       "policy_mode": "hybrid",
       "keep_ratio": 0.1062,
       "s_budget": 9,
-      "hits": 8,
-      "n_trials": 8,
+      "hits": 16,
+      "n_trials": 16,
       "accuracy_pct": 100.0,
       "wilson_95_ci_pct": [
-        67.6,
+        80.6,
         100.0
       ],
       "accuracy_by_depth": {
-        "10%": "2/2 (100%)",
-        "25%": "2/2 (100%)",
-        "50%": "2/2 (100%)",
-        "75%": "2/2 (100%)"
+        "10%": "4/4 (100%)",
+        "25%": "4/4 (100%)",
+        "50%": "4/4 (100%)",
+        "75%": "4/4 (100%)"
       },
       "kv_mem_pct": 20.75,
       "total_mem_incl_dict_pct": 21.19,
-      "next_token_logit_cosine": 0.8855,
+      "next_token_logit_cosine": 0.8926,
       "decode_tok_per_s": 0.25
     }
   },

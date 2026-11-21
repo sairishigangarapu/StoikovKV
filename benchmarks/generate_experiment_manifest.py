@@ -37,6 +37,8 @@ def main() -> None:
         "src/stoikov_kv/elastic_lexico.py",
         "src/stoikov_kv/matryoshka_spec.py",
         "benchmarks/bench_real_models_audit.py",
+        "benchmarks/audit_speculative_distribution.py",
+        "benchmarks/extend_7b_niah_16.py",
         "benchmarks/bench_real_qwen_publication.py",
         "benchmarks/bench_cache_ablation.py",
         "benchmarks/bench_calibration_codec.py",
