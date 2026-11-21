@@ -23,6 +23,7 @@ from .elastic_lexico import (
 from .cache import (
     DynamicCache,
     StoikovKVCache,
+    OnlineRegimeChangeController,
     HMMTopicShiftController,
     create_mock_artifacts,
     load_or_create_artifacts,
@@ -55,6 +56,7 @@ __all__ = [
     "compute_break_even_length",
     "DynamicCache",
     "StoikovKVCache",
+    "OnlineRegimeChangeController",
     "HMMTopicShiftController",
     "create_mock_artifacts",
     "load_or_create_artifacts",

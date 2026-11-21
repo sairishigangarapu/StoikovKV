@@ -9,9 +9,10 @@ Implements:
   initializer (`U_Q`, `head_roles`, `D`, `W_ridge`, `head_entropy`) using only forward
   projection hooks (`output_attentions=False`), enabling immediate standalone execution
   when `calibrated_artifacts.pt` does not exist yet.
-- `HMMTopicShiftController`: Online non-stationary regime-change detector tracking EMA
-  centroid and deviation of subspace/value features; triggers rapid H2O score decay
-  (`beta_shift = 0.65` vs stationary `beta_stationary = 0.99`) upon topic shifts (`z_score > 1.4`).
+- `OnlineRegimeChangeController` (legacy alias `HMMTopicShiftController`): Online non-stationary
+  regime-change detector tracking EMA centroid and deviation of subspace/value features; triggers
+  rapid H2O score decay (`beta_shift = 0.65` vs stationary `beta_stationary = 0.99`) upon topic
+  shifts (`z_score > 1.4`).
 - `StoikovKVCache(DynamicCache)`: FlashAttention/SDPA-compatible hybrid KV cache with:
   1. Uncompressed FP16 sliding window of `n_b = 64` recent tokens across all KV heads.
   2. Write-time directional query-subspace importance probe (softplus-gated on pretrained
@@ -487,21 +488,21 @@ def load_or_create_artifacts(
 
 
 # ============================================================================
-# HMM Non-Stationary Regime Controller (Topic-Shift Decay & Budget Hook)
+# Online Regime-Change Decay Controller (EMA Centroid/Deviation Detector)
 # ============================================================================
 
 
 @dataclass
-class HMMTopicShiftController:
+class OnlineRegimeChangeController:
     """
-    Online Hidden Markov / Subspace-Shift Controller for StoikovKV:
-    - Computes the normalized subspace projection distribution across `U_Q` ranks
-      at write time (`output_attentions=False`).
-    - Tracks an exponential moving average (EMA) of the subspace feature centroid and
-      entropy. When a topic shift (e.g., Turn-1 Python/Config -> Turn-2 CSS styling)
-      produces a divergence z-score > `shift_z_threshold` (`1.4`), transitions into the
-      non-stationary decay regime (`beta_t = beta_shift = 0.65` vs stationary
-      `beta_stationary = 0.99`) so stale Turn-1 heavy hitters decay rapidly.
+    Online EMA Centroid/Deviation Regime-Change Decay Controller for StoikovKV
+    (exported with legacy alias `HMMTopicShiftController`):
+    - Computes normalized subspace/value features at write time (`output_attentions=False`).
+    - Tracks an exponential moving average (EMA) of the feature centroid and deviation.
+      When a topic shift (e.g., Turn-1 Python/Config -> Turn-2 CSS styling) produces a
+      normalized drift z-score > `shift_z_threshold` (`1.4`), pulses the heavy-hitter
+      decay factor (`beta_t = beta_shift = 0.65` vs stationary `beta_stationary = 0.99`)
+      so stale Turn-1 heavy hitters decay rapidly.
     """
 
     beta_stationary: float = 0.99
@@ -577,6 +578,10 @@ class HMMTopicShiftController:
             }
         )
         return beta_t, self.keep_ratio, self.s_budget
+
+
+# Backward-compatible alias for legacy callers and unit tests
+HMMTopicShiftController = OnlineRegimeChangeController
 
 
 # ============================================================================
@@ -765,7 +770,7 @@ class StoikovKVCache(DynamicCache):
         sink_tokens: int = 4,
         sink_bonus: float = 100.0,
         policy_mode: str = "hybrid",
-        controller: Optional[HMMTopicShiftController] = None,
+        controller: Optional[OnlineRegimeChangeController] = None,
         controller_fn: Optional[Callable[[int, int], Tuple[float, float, int]]] = None,
         enable_hmm_decay: bool = True,
         max_rollback_window: int = 32,
@@ -862,7 +867,7 @@ class StoikovKVCache(DynamicCache):
         self._rope_sin_cache: Optional[torch.Tensor] = None
         self._rope_cache_len: int = 0
         self._rope_cache_dev: Optional[torch.device] = None
-        self.controller = controller or HMMTopicShiftController(
+        self.controller = controller or OnlineRegimeChangeController(
             keep_ratio=self.keep_ratio,
             s_budget=self.s_budget,
             enable_hmm_decay=enable_hmm_decay,

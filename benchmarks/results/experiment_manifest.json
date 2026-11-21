@@ -1,7 +1,7 @@
 {
-  "generated_utc": "2026-11-21T05:25:55.060896+00:00",
+  "generated_utc": "2026-11-21T06:56:35.470478+00:00",
   "git_branch": "product-repo-layout",
-  "git_commit": "04b099c17d43b53d4b7a0dc6d29f62ef12c67274",
+  "git_commit": "ac29dca9b8eb7e53948a0b4478d4acfb4326a3bd",
   "hardware": {
     "os": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
     "python": "3.12.3",
@@ -28,7 +28,7 @@
   },
   "source_sha256": {
     "src/stoikov_kv/calibration.py": "c50e248ec57042ad2a5f22d6fb29c45f827e5ab95508408b7d0c9f9b5297a689",
-    "src/stoikov_kv/cache.py": "d646536d12c1fe42de1d164da5051ccc777790a023baf25382f2a70fb0ca446c",
+    "src/stoikov_kv/cache.py": "62cb5867c047434867cdbbfc15bf9a388c550e44735af111b11587943d078afe",
     "src/stoikov_kv/elastic_lexico.py": "fc72504100b3e7da825973d6295857afb5b3a9590af40a34bb95500724802008",
     "src/stoikov_kv/matryoshka_spec.py": "0baa7217349f15ade6c2000077aadd2b998c2089a2145f9fefc817029047f867",
     "benchmarks/bench_real_models_audit.py": "501dc548bff6c59155a68726797f4540f4b58edbda19a4f745023e62b222cbc3",
