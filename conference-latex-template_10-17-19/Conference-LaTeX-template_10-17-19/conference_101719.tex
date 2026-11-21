@@ -88,7 +88,28 @@ r(s, q, t) = s - q \gamma_{\text{risk}} \sigma^2 (T - t),
 \delta_a + \delta_b = \gamma_{\text{risk}} \sigma^2 (T - t) + \frac{2}{\gamma_{\text{risk}}} \ln\!\left(1 + \frac{\gamma_{\text{risk}}}{\kappa}\right).
 \label{eq:as_spread}
 \end{equation}
-We emphasize that \eqref{eq:as_reservation}--\eqref{eq:as_spread} serve strictly as a conceptual design analogy rather than a formal Hamilton--Jacobi--Bellman optimality proof or closed-form runtime formula solved per token. In our codebase, this analogy maps directly onto four concrete engineering mechanisms whose benefits stand independently on empirical performance: (1) write-time token utility $I_t$ (\texttt{score\_write\_time}, analogous to mid-price $s$); (2) enforcing a fixed KV memory budget via eviction or sparse coding as occupancy grows (\texttt{solve\_equal\_budget\_params} and \texttt{keep\_ratio}, analogous to inventory pressure $q$); (3) accelerating stale heavy-hitter decay when online feature drift spikes (\texttt{HMMTopicShiftController} pulsing $\beta_{\text{shift}} = 0.65$, analogous to volatility $\sigma^2$); and (4) routing heads by eviction sensitivity (\texttt{head\_roles}, analogous to risk aversion $\gamma_{\text{risk}}$) into exact FP16, heavy-hitter eviction, or sparse dictionary tiers.
+We emphasize that \eqref{eq:as_reservation}--\eqref{eq:as_spread} serve strictly as a conceptual design analogy rather than a formal Hamilton--Jacobi--Bellman optimality proof or closed-form runtime formula solved per token. Table~\ref{tab:as_analogy} details the term-by-term structural analogy from \eqref{eq:as_reservation}--\eqref{eq:as_spread} to our concrete code mechanisms and their observed systems benefits, each of which stands independently on empirical evaluation.
+
+\begin{table*}[t]
+\caption{Conceptual Design Analogy Mapping the Avellaneda--Stoikov Equations \eqref{eq:as_reservation}--\eqref{eq:as_spread} to StoikovKV Code Mechanisms}
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Avellaneda--Stoikov Term} & \textbf{Limit-Order-Book Role} & \textbf{StoikovKV Code Mechanism} & \textbf{Observed Systems Benefit} \\
+\hline
+Mid-Price $s$ & Intrinsic asset value before skew & Write-time salience $I_t$ (\texttt{score\_write\_time} + pre-RoPE rarity) & $O(d{\cdot}r)$ online scoring ($\rho = 0.48$--$0.57$ vs.\ $\approx 0$ for $\|V_t\|_2$) \\
+Inventory $q$ & Held position pressure near risk cap & Resident KV budget cap (\texttt{solve\_equal\_budget\_params}, \texttt{keep\_ratio}) & $4.56\times$ physical KV compaction ($6.03$ vs.\ $27.48\text{ MB}$ at 1K) \\
+Volatility $\sigma^2$ & Regime variance penalizing stale stock & Online value-feature drift $z_c$ (\texttt{HMMTopicShiftController}, $\beta_{\text{shift}}=0.65$) & $2.94\times$ Turn-2 heavy-hitter freshness ($67.7\%$ vs.\ $23.0\%$) \\
+Risk Aversion $\gamma_{\text{risk}}$ & Sensitivity to inventory liquidation & Per-head eviction risk (\texttt{head\_roles}: Tier 0 FP16 / Tier 1 / Tier 2) & Protects copy heads ($85\%$--$100\%$ NIAH) at $\sim 21\%$ KV bytes \\
+Horizon $(T - t)$ & Exposure window to regime drift & Token age $\Delta t$ past local window $n_b = 32$ ($\beta_t^{\Delta t / 16}$ decay) & Exact recent syntax ($n_b=32$); decays stale filler over turns \\
+Intensity $\kappa$ / Spread $\delta_a{+}\delta_b$ & Order-flow depth \& graded quote width & Head entropy $H_{l,h}$ \& nested sparse atoms ($m \in \{2,4,8,12\} \to s=16$) & Graded draft/verify bandwidth ($66\%$ BW saved, $32/32$ parity) \\
+\hline
+\end{tabular}%
+}
+\label{tab:as_analogy}
+\end{center}
+\end{table*}
 
 \subsection{End-to-End Online Dataflow}
 Every layer maintains an uncompressed recent sliding window of $n_b = 32$ tokens across all KV heads so local syntactic dependencies remain exact. As tokens age out of this window, each KV head $(l, h)$ routes them strictly according to its offline-assigned role into either Tier 0 (exact FP16), Tier 1 (physically compacted heavy-hitter buffer), or Tier 2 (pre-RoPE sparse dictionary payload). Importantly, \texttt{StoikovKVCache} inherits from HuggingFace \texttt{DynamicCache} without duplicating tensors in \texttt{key\_cache}/\texttt{value\_cache}, ensuring that logical compressed KV bytes equal physical resident GPU tensor bytes (\texttt{compressed\_bytes == physical\_resident\_bytes}).
