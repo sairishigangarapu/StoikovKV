@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument(
         "--suite",
         default="all",
-        choices=["all", "calibration", "cache", "e2e"],
+        choices=["all", "calibration", "cache", "e2e", "hikvp"],
         help="Benchmark suite to run",
     )
 
@@ -172,10 +172,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             "calibration": ["benchmarks/bench_calibration_codec.py"],
             "cache": ["benchmarks/bench_cache_speculative.py"],
             "e2e": ["benchmarks/bench_end_to_end.py"],
+            "hikvp": ["benchmarks/bench_hikvp_atlas.py"],
             "all": [
                 "benchmarks/bench_calibration_codec.py",
                 "benchmarks/bench_cache_speculative.py",
                 "benchmarks/bench_end_to_end.py",
+                "benchmarks/bench_hikvp_atlas.py",
             ],
         }[args.suite]
         for sc in scripts:

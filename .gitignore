@@ -41,3 +41,6 @@ frontend/*.tsbuildinfo
 *.pptx
 *.docx
 *.pdf
+*.zip
+.DS_Store
+conference-latex-template*

@@ -225,3 +225,30 @@ Evaluated on a `1,068`-token prompt generating `64` new tokens with verify spars
 ### 7.2 Pretrained `Qwen/Qwen2.5-7B-Instruct` Offloaded Hardware Check (8 GB RTX 4060 Laptop)
 - **Placement:** Layers `0..9` on GPU (`5.75 GB`), Layers `10..27` offloaded to CPU (`8.25 GB`), peak VRAM `6.94 GB`.
 - **KV Memory Reduction on Real 7B:** `60.1%` (Early, 28 MB FP16 KV), `63.1%` (Middle, 32 MB FP16 KV), `67.3%` (Late, 40 MB FP16 KV) at `0.77 - 0.82 tok/s` (CPU offload bound).
+
+### 7.3 100% GPU `Qwen/Qwen2.5-7B-Instruct` (4-bit NF4) Comparative Audit & Avellaneda–Stoikov Control (`benchmarks/comparative_audit`)
+Evaluated 100% on `cuda:0` (`NVIDIA GeForce RTX 4060 Laptop GPU`, `6.5 GiB` budget, zero CPU offload, `~5.35 GB` allocated VRAM) using `bitsandbytes` 4-bit NF4 weights, `artifacts/real_qwen_7b_audit_artifacts.pt` (`28` layers $\times$ `4` KV heads: `6` `ROLE_RETRIEVAL_FP16`, `100` `ROLE_PEAKED_H2O`, `6` `ROLE_DIFFUSE_LEXICO`), fused Triton decode+RoPE, in-place batch-flush slab, and closed-loop **Avellaneda–Stoikov (2008)** inventory control ($\text{skew}_t = q_t \gamma \sigma_t^2$, $\delta_t^* = \frac{1}{2}\gamma\sigma_t^2 + \frac{1}{\gamma}\ln(1 + \gamma/\kappa)$):
+
+| Method (`Qwen/Qwen2.5-7B-Instruct` 4-bit NF4) | Needle Retrieval Acc | Context-Drift Top-1 (`P(' ditch')`) | Multi-Fact QA (`long_context_quality`) | KV Savings @ `4K` | Decode Throughput @ `4K, gen=128` |
+|---|---:|---:|---:|---:|---:|
+| **Full FP16** (`B0_full_fp16`) | **100.0%** | **100.0%** (`1.0000`) | **100.0%** | 0.0% | **24.43 tok/s** *(up from 19.66)* |
+| **Standalone H2O** (`B3_standalone_h2o`) | 50.0%–55.6% | 0.0% (`0.1654`) | 15.6%–21.9% | 78.5% | **24.03 tok/s** *(up from 13.74, `1.75x`)* |
+| **Standalone Lexico** (`B3_standalone_lexico`) | **100.0%** | 0.0% (`0.0122`) | 9.4%–12.5% | **81.6%** | **13.50 tok/s** *(up from 4.67, `2.89x`)* |
+| **StoikovKV Hybrid** (`B4_stoikovkv_hybrid`) | **100.0%** | **100.0%** (`1.0000`) | **43.8%** *(`3.5x` over static)* | **78.8%** | **19.33 tok/s** *(up from 13.27, `1.46x`)* |
+
+---
+
+## 8. Fused Triton Sparse Decode + Half-Split RoPE Kernel Benchmark (`stoikov_kv.triton_kernels`)
+
+Evaluated on `NVIDIA GeForce RTX 4060 Laptop GPU` (`s = 16` atoms, `head_dim = 128`, `200` timed repetitions after `10` warmups), comparing eager PyTorch (`F.embedding` + `float32` broadcast reduction) against single-launch `_lexico_reconstruct_kernel` (direct `int16`/`int8`/`fp16` register accumulation with zero intermediate `[N, s, d]` HBM allocation):
+
+| Sequence Length ($N$) | PyTorch Eager Latency (Temp VRAM) | Fused Triton Latency (Temp VRAM) | Kernel Speedup | Temp VRAM Reduction | Reconstruction Cosine vs. PyTorch |
+|---:|---:|---:|---:|---:|---:|
+| **1,024** | `0.097 ms` (`+16.75 MB`) | **`0.070 ms`** (`+0.50 MB`) | **1.38$\times$** | **33.5$\times$ less** | `1.0000000` (1 ULP FP16) |
+| **4,096** | `0.621 ms` (`+67.00 MB`) | **`0.072 ms`** (`+2.00 MB`) | **8.68$\times$** | **33.5$\times$ less** | `1.0000000` (1 ULP FP16) |
+| **16,384** | `2.500 ms` (`+268.12 MB`) | **`0.095 ms`** (`+8.00 MB`) | **26.20$\times$** | **33.5$\times$ less** | `1.0000000` (1 ULP FP16) |
+
+- **End-to-End 28-Layer Standalone GQA (`1.5B` FP16 @ `ctx = 4,096, gen = 128`):**
+  - `standalone_lexico`: **`5.49 -> 19.47 tok/s` (`3.55x` faster)** at `81.6%` KV savings
+  - `hybrid` (`StoikovKV`): **`15.36 -> 22.16 tok/s` (`1.44x` faster)** at `78.6%` KV savings
+  - `full_fp16`: **`24.64 -> 42.96 tok/s` (`1.74x` faster)**

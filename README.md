@@ -1,11 +1,11 @@
 # StoikovKV
 
-**StoikovKV** is a hybrid KV-cache compression and routing library for Grouped-Query Attention (GQA) language models. It combines write-time query-subspace probing, per-head role routing, 1-step preconditioned ElasticNet dictionary coding, non-stationary HMM topic-shift decay, and Matryoshka self-speculative decoding.
+**StoikovKV** is a hybrid KV-cache compression, closed-loop inventory control, and hierarchical offloading engine for Grouped-Query Attention (GQA) language models. It combines FlashAttention/SDPA-compatible write-time query-subspace probing (`output_attentions=False`), per-head role routing, fused Triton sparse dictionary decoding (+ RoPE), Avellaneda–Stoikov (2008) inventory/volatility control, 3-level CPU-offloaded `HiKVP`/`AtlasKV` retrieval, and Matryoshka self-speculative decoding.
 
 > **📊 Benchmark Numbers & Theory Documentation:**
 > Browse **[`docs/benchmarks/`](./docs/benchmarks/)** for the ordered benchmark documentation:
-> 1. **[`01_BENCHMARK_NUMBERS.md`](./docs/benchmarks/01_BENCHMARK_NUMBERS.md)** — Complete measured numbers across calibration, 1-step ElasticNet vs. OMP/FISTA, 4-way equal-budget cache ablation, Matryoshka speculative decoding, multi-length Needle-in-a-Haystack, WikiText-103, and real pretrained `Qwen/Qwen2.5-1.5B-Instruct` GPU validation.
-> 2. **[`02_BENCHMARK_THEORY_AND_INTERPRETATION.md`](./docs/benchmarks/02_BENCHMARK_THEORY_AND_INTERPRETATION.md)** — Detailed theory guide explaining **what each test means**, **how each result was produced**, and **how to interpret the metrics** across all benchmark suites and all 20 unit tests.
+> 1. **[`01_BENCHMARK_NUMBERS.md`](./docs/benchmarks/01_BENCHMARK_NUMBERS.md)** — Complete measured numbers across calibration, fused Triton decode (`26.2x` speedup, `33.5x` less temp VRAM), 1-step ElasticNet vs. OMP/FISTA, equal-budget cache ablations, Matryoshka speculative decoding, `HiKVP`/`AtlasKV` offloading, and 100% GPU `Qwen/Qwen2.5-7B-Instruct` (4-bit NF4) validation.
+> 2. **[`02_BENCHMARK_THEORY_AND_INTERPRETATION.md`](./docs/benchmarks/02_BENCHMARK_THEORY_AND_INTERPRETATION.md)** — Detailed theory guide explaining **what each test means**, **how each result was produced**, and **how to interpret the metrics** across all benchmark suites and all 33 unit tests.
 
 ---
 
@@ -19,13 +19,16 @@
 │       ├── __init__.py
 │       ├── calibration.py          # Streaming O(B*T) subspace (U_Q), head-role & dictionary calibration
 │       ├── elastic_lexico.py       # 1-step ElasticNet sparse dictionary codec + OMP/FISTA baselines
-│       ├── cache.py                # StoikovKVCache(DynamicCache) + HMMTopicShiftController
-│       ├── matryoshka_spec.py      # Single-pass (gamma+1) Matryoshka self-speculative decoding
+│       ├── triton_kernels.py       # Fused Triton sparse dictionary decode + half-split RoPE kernel
+│       ├── cache.py                # StoikovKVCache(DynamicCache) + Avellaneda-Stoikov controller
+│       ├── hikvp.py                # 3-level pre-RoPE CPU-offloaded KV index + GPU LRU page cache
+│       ├── atlas_memory.py         # AtlasKV Doc2KV / KG2KV persistent memory & rectangular attention
+│       ├── matryoshka_spec.py      # Single-pass (n_draft+1) Matryoshka self-speculative decoding
 │       └── cli.py                  # Command-line interface (calibrate, chat, bench, serve)
 ├── docs/
 │   ├── benchmarks/                 # Ordered benchmark numbers & theory documentation
 │   │   ├── README.md               # Ordered reading guide for benchmarks & theory
-│   │   ├── 01_BENCHMARK_NUMBERS.md # Consolidated empirical benchmark tables (Sections 1-7)
+│   │   ├── 01_BENCHMARK_NUMBERS.md # Consolidated empirical benchmark tables (Sections 1-8)
 │   │   └── 02_BENCHMARK_THEORY_AND_INTERPRETATION.md # Test meanings, derivations & interpretation
 │   └── reports/historical/         # Archived hackathon reports & raw snapshots
 ├── server/                         # FastAPI OpenAI-compatible (/v1/chat/completions) & telemetry backend
@@ -38,13 +41,15 @@
 │   ├── bench_context_drift.py      # Multi-turn topic-shift & H2O freshness evaluation
 │   ├── bench_context_switch.py     # Multi-turn context switching evaluation
 │   ├── bench_longbench.py          # Long-context task evaluation suite
+│   ├── bench_hikvp_atlas.py        # 3-level HiKVP/AtlasKV CPU-offloading & LRU cache sweep
 │   ├── comparative_audit/          # Configurable multi-seed comparative audit runner
 │   └── results/                    # Generated plots & JSON metrics (gitignored)
 ├── experiments/
 │   └── 7b_gpu_validation/          # WikiText-103 & 7B GPU calibration/offloading scripts
-├── tests/                          # Unit test suites (20 tests)
+├── tests/                          # Unit test suites (33 tests)
 │   ├── test_calibration_and_codec.py
-│   └── test_cache_and_speculative.py
+│   ├── test_cache_and_speculative.py
+│   └── test_hikvp_and_atlas.py
 ├── artifacts/                      # Local calibrated .pt artifacts (gitignored)
 ├── models/                         # Local model weight shards (gitignored)
 └── data/                           # Local evaluation datasets (gitignored)
@@ -64,25 +69,27 @@
      - `ROLE_DIFFUSE_LEXICO (2)`: High-entropy diffuse heads (`~11%`) compressed into $s$ sorted dictionary atoms (`3s + 2` bytes/vector).
    - Trains per-layer normalized dictionaries $D \in \mathbb{R}^{L \times d \times N}$ on pre-RoPE keys and values, and precomputes the ridge projection matrix $W_{\text{ridge}} = (D^\top D + \lambda_2 I)^{-1} D^\top$ in FP64 (`residual < 1.5e-15`).
 
-2. **Sparse Dictionary Codec (`stoikov_kv.elastic_lexico`):**
-   - Encodes vectors in a single matrix-multiply + soft-threshold + top-$s$ selection pass (`0.53 ms` on GPU, `3.17x–31.60x` faster than OMP and `15.11x–16.87x` faster than FISTA), sorting atoms by descending magnitude (`|y_(1)| >= ... >= |y_(s)|`) and quantizing values to `int8` with a per-vector FP16 scale.
-   - Un-rotates keys into the pre-RoPE frame prior to dictionary encoding and re-applies RoPE at the stored token position upon decoding.
+2. **Fused Triton Sparse Dictionary Codec (`stoikov_kv.elastic_lexico`, `stoikov_kv.triton_kernels`):**
+   - Encodes vectors in a single matrix-multiply + soft-threshold + top-$s$ selection pass (`0.53 ms` on GPU, `3.17x–37.58x` faster than OMP and `12.11x–16.87x` faster than FISTA), sorting atoms by descending magnitude (`|y_(1)| >= ... >= |y_(s)|`) and quantizing values to `int8` with a per-vector FP16 scale.
+   - Reconstructs pre-RoPE keys and applies half-split RoPE rotation in a **single fused Triton kernel** (`_lexico_reconstruct_kernel`), achieving **`8.68x` speedup at 4K** and **`26.20x` speedup at 16K** (`2.500 ms -> 0.095 ms`, cosine similarity `1.0000000`) while cutting temporary VRAM overhead by **`33.5x`** (zero intermediate `[N, m, d]` HBM allocation).
 
-3. **Live Physically Compacted Hybrid Cache & HMM Controller (`stoikov_kv.cache`):**
-   - Maintains a recent uncompressed sliding window (`n_b = 64` tokens) and routes overflowing tokens per KV head according to `head_roles` with zero duplicate storage (`physical_resident_bytes == compressed_bytes`).
-   - Compacts pure-H2O layers to `[B, H_kv, k_kept + n_b, d]` with a 1-token virtual partition sink and automatic SDPA mask slicing.
-   - Tracks query-subspace projection energy shifts via `HMMTopicShiftController`, accelerating score decay ($\beta_t = 0.65$) on topic transitions so stale heavy hitters are replaced (`100.0%` Turn-2 freshness).
+3. **In-Place Compacted Hybrid Cache & Avellaneda–Stoikov Controller (`stoikov_kv.cache`):**
+   - Stages incoming decode tokens in a pre-allocated in-place FP16 slab (`n_b = 64` + batch-flush stride) with shared-storage pure-layer views (`physical_resident_bytes == compressed_bytes`).
+   - Implements closed-loop **Avellaneda–Stoikov (2008)** inventory control ($\text{skew}_t = q_t \gamma \sigma_t^2$, $\delta_t^* = \frac{1}{2}\gamma\sigma_t^2 + \frac{1}{\gamma}\ln(1 + \gamma/\kappa)$) via `OnlineRegimeChangeController`: relaxes `keep_ratio` when VRAM headroom $q_t < 0$ is ample (`3.5x` gain on 7B multi-fact QA: `12.5% -> 43.8%`), tightens back to `~78.8%` KV memory savings as $q_t \to +1$, and triggers single-step decay ($\beta_{\text{shift}} = 0.65$) on semantic regime shifts.
 
-4. **Matryoshka Self-Speculative Decoding (`stoikov_kv.matryoshka_spec`):**
-   - Drafts $\gamma_{\text{spec}}$ candidate tokens using only the top $m < s$ dictionary atoms on `ROLE_DIFFUSE_LEXICO` heads (`3m + 2` bytes/vector) and verifies all $\gamma_{\text{spec}} + 1$ positions in a single batched forward pass using all $s$ atoms, rolling back rejected tokens losslessly via `StoikovKVCache.crop(max_length)`.
+4. **3-Level Offloaded `HiKVP` & `AtlasMemoryBank` (`stoikov_kv.hikvp`, `stoikov_kv.atlas_memory`):**
+   - Offloads pre-RoPE leaf pages to pinned CPU RAM / `mmap` under an $O(N^{1/3})$ GPU root index and fixed-capacity GPU LRU cache (`1.14 MB` flat GPU footprint across `2K -> 16K`), gated by the Avellaneda–Stoikov optimal half-spread to prune redundant PCIe fetches.
+
+5. **Matryoshka Self-Speculative Decoding (`stoikov_kv.matryoshka_spec`):**
+   - Drafts candidate tokens using top $m < s$ dictionary atoms (`3m + 2` bytes/vector) with Avellaneda–Stoikov confidence-margin early stopping, and verifies all drafted positions in a single batched forward pass using all $s$ atoms with lossless `crop()` rollback.
 
 ---
 
 ## Engineering Status & Validation Summary
 
-- **Complete Unit & Integration Test Coverage:** All **20 unit tests** (`tests/test_calibration_and_codec.py` and `tests/test_cache_and_speculative.py`) pass.
-- **Physical == Logical KV Memory:** `StoikovKVCache` stores only tier-specific physical buffers (`fp16`, `h2o`, or packed `uint8`/`int8` `lexico`) with zero duplicate `DynamicCache` storage.
-- **Drop-In HuggingFace & Pretrained Weight Validation:** Validated end-to-end on real pretrained `Qwen/Qwen2.5-1.5B-Instruct` and `Qwen/Qwen2.5-7B-Instruct` weights (`model.generate(past_key_values=cache)` and `matryoshka_speculative_generate`). See **[`docs/benchmarks/`](./docs/benchmarks/)** for full tables and analysis.
+- **Complete Unit & Integration Test Coverage:** All **33 unit tests** (`pytest tests/`) pass, including fused Triton decode+RoPE parity, lossless speculative rollback, and `HiKVP`/`AtlasKV` offloading.
+- **Physical == Logical KV Memory:** `StoikovKVCache` stores only tier-specific physical buffers (`fp16`, `h2o`, or packed `int16`/`int8` `lexico`) with zero duplicate `DynamicCache` storage.
+- **100% GPU `Qwen/Qwen2.5-7B-Instruct` Validation (8 GB RTX 4060):** In 4-bit NF4 (`bitsandbytes`), `StoikovKV` Hybrid achieves **`78.8%` KV memory savings** at `4K` context, **`100.0%` needle-in-a-haystack**, **`100.0%` context-drift top-1 (`P = 1.0000`)**, **`43.8%` multi-fact QA** (vs. `15.6%` H2O / `12.5%` Lexico), and **`19.33 tok/s`** decode throughput (`24.03 tok/s` on standalone H2O; `13.50 tok/s` on standalone Lexico, up `2.89x` from `4.67 tok/s`). See **[`docs/benchmarks/`](./docs/benchmarks/)** for full tables.
 
 ---
 
@@ -92,8 +99,11 @@
 # Install in editable mode
 pip install -e .
 
-# Run all 20 unit tests
-python3 -m unittest tests/test_calibration_and_codec.py tests/test_cache_and_speculative.py -v
+# Run all 33 unit tests
+PYTHONPATH=src python3 -m pytest tests/ -v
+
+# Run comparative audit on real Qwen2.5-7B-Instruct (4-bit NF4 on CUDA)
+PYTHONPATH=src python3 benchmarks/comparative_audit/scripts/run_benchmarks.py --track real_7b --quick
 
 # Run calibration + sparse codec benchmark (writes to benchmarks/results/)
 python3 benchmarks/bench_calibration_codec.py

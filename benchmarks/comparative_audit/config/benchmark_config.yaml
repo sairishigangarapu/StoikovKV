@@ -22,13 +22,14 @@ model:
     name: "Qwen/Qwen2.5-7B-Instruct"
     dtype: "float16"
     device: "cuda"
+    artifacts_path: "artifacts/real_qwen_7b_audit_artifacts.pt"
     quantization:
-      enabled: false
-      method: "bitsandbytes"  # or "quanto"
+      enabled: true
+      method: "bitsandbytes"  # 4-bit NF4 + double quant (fits 8GB VRAM with no CPU offload)
       bits: 4
       compute_dtype: "float16"
-    cpu_offload: true
-    max_gpu_memory: "7GB"
+    cpu_offload: false
+    max_gpu_memory: "6.5GiB"
 
 # Benchmark Parameters
 benchmark:
@@ -48,10 +49,10 @@ benchmark:
   seeds: [42, 123, 456]
   
   # Warmup iterations
-  warmup_iterations: 3
+  warmup_iterations: 1
   
   # Timing iterations
-  timing_iterations: 10
+  timing_iterations: 5
 
 # Baseline Configurations
 baselines:
@@ -106,86 +107,33 @@ baselines:
     h2o_context_window: 1
     max_rollback_window: 32
 
-# Ablation Configurations
+# Ablation Configurations (distinct parameter sets; full_fp16 is already covered by B0_full_fp16)
 ablations:
-  - name: "full_fp16"
-    description: "Full FP16 cache (reference)"
-    policy_mode: "full_fp16"
-    n_b: 64
-    keep_ratio: 1.0
-    s_budget: 16
-    enable_hmm_decay: false
-  
-  - name: "routing_only"
-    description: "StoikovKV routing only, other transformations disabled"
+  - name: "routing_no_eviction"
+    description: "StoikovKV hybrid routing without H2O eviction or HMM adaptation (keep_ratio=1.0)"
     policy_mode: "hybrid"
     n_b: 64
     keep_ratio: 1.0
     s_budget: 16
     enable_hmm_decay: false
-    # Note: Need custom implementation to disable H2O and Lexico
-  
-  - name: "routing_plus_retrieval_fp16"
-    description: "Routing plus retrieval-protected FP16 heads"
-    policy_mode: "hybrid"
-    n_b: 64
-    keep_ratio: 1.0
-    s_budget: 16
-    enable_hmm_decay: false
-    # Only Retrieval heads use FP16; others pass through
-  
-  - name: "routing_plus_h2o"
-    description: "Routing plus H2O eviction"
+
+  - name: "full_stoikovkv_no_adaptation"
+    description: "Full StoikovKV (routing + H2O + Lexico) with HMM drift adaptation disabled"
     policy_mode: "hybrid"
     n_b: 64
     keep_ratio: 0.15
     s_budget: 16
     enable_hmm_decay: false
-    # Lexico heads fall back to FP16 or H2O
-  
-  - name: "routing_plus_lexico"
-    description: "Routing plus Lexico dictionary coding"
-    policy_mode: "hybrid"
-    n_b: 64
-    keep_ratio: 1.0
-    s_budget: 16
-    enable_hmm_decay: false
-    # H2O heads fall back to FP16
-  
-  - name: "routing_plus_h2o_lexico"
-    description: "Routing plus H2O and Lexico (no adaptation)"
-    policy_mode: "hybrid"
-    n_b: 64
-    keep_ratio: 0.15
-    s_budget: 16
-    enable_hmm_decay: false
-  
+    h2o_context_window: 1
+
   - name: "full_stoikovkv_with_adaptation"
-    description: "Full StoikovKV with adaptation/drift detection"
+    description: "Full StoikovKV (routing + H2O + Lexico) with HMM drift adaptation enabled"
     policy_mode: "hybrid"
     n_b: 64
     keep_ratio: 0.15
     s_budget: 16
     enable_hmm_decay: true
     h2o_context_window: 1
-  
-  - name: "full_stoikovkv_no_adaptation"
-    description: "Full StoikovKV with adaptation disabled"
-    policy_mode: "hybrid"
-    n_b: 64
-    keep_ratio: 0.15
-    s_budget: 16
-    enable_hmm_decay: false
-    h2o_context_window: 1
-  
-  - name: "fixed_routing"
-    description: "Fixed routing (no dynamic updates)"
-    policy_mode: "hybrid"
-    n_b: 64
-    keep_ratio: 0.15
-    s_budget: 16
-    enable_hmm_decay: false
-    # Routing fixed from calibration
 
 # Evaluation Datasets
 datasets:

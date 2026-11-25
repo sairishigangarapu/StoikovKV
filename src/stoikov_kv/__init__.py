@@ -25,8 +25,14 @@ from .cache import (
     StoikovKVCache,
     OnlineRegimeChangeController,
     HMMTopicShiftController,
+    stoikov_control_step,
     create_mock_artifacts,
     load_or_create_artifacts,
+)
+from .triton_kernels import (
+    HAS_TRITON,
+    can_use_triton,
+    triton_lexico_reconstruct,
 )
 from .matryoshka_spec import (
     MatryoshkaSpecResult,
@@ -35,6 +41,21 @@ from .matryoshka_spec import (
 from .server import (
     StoikovInferenceEngine,
     create_http_server,
+)
+from .hikvp import (
+    HiKVPConfig,
+    HiKVPPage,
+    GPULRUPageCache,
+    HierarchicalKVHeadIndex,
+    HiKVPStore,
+)
+from .atlas_memory import (
+    AtlasTriple,
+    AtlasDocumentChunk,
+    AtlasMemoryBank,
+    format_kg_triples,
+    apply_rope_to_atlas_keys,
+    rectangular_attention,
 )
 
 __all__ = [
@@ -58,10 +79,25 @@ __all__ = [
     "StoikovKVCache",
     "OnlineRegimeChangeController",
     "HMMTopicShiftController",
+    "stoikov_control_step",
+    "HAS_TRITON",
+    "can_use_triton",
+    "triton_lexico_reconstruct",
     "create_mock_artifacts",
     "load_or_create_artifacts",
     "MatryoshkaSpecResult",
     "matryoshka_speculative_generate",
     "StoikovInferenceEngine",
     "create_http_server",
+    "HiKVPConfig",
+    "HiKVPPage",
+    "GPULRUPageCache",
+    "HierarchicalKVHeadIndex",
+    "HiKVPStore",
+    "AtlasTriple",
+    "AtlasDocumentChunk",
+    "AtlasMemoryBank",
+    "format_kg_triples",
+    "apply_rope_to_atlas_keys",
+    "rectangular_attention",
 ]

@@ -537,6 +537,36 @@ class TestStoikovKVPerson1Pipeline(unittest.TestCase):
             pols["stoikov_hybrid_s16"]["passkey_top1_accuracy"],
         )
 
+    def test_triton_lexico_decode_parity(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available for Triton parity check.")
+        from stoikov_kv.triton_kernels import HAS_TRITON, triton_lexico_reconstruct
+        if not HAS_TRITON:
+            self.skipTest("Triton not installed.")
+
+        torch.manual_seed(7)
+        d = torch.randn(2, 128, 128, device="cuda", dtype=torch.float16)
+        codec = ElasticLexicoCodec(D=d)
+        x = torch.randn(2, 256, 128, device="cuda", dtype=torch.float16)
+        idx, q_val = codec.encode(x, layer_idx=1, s=16)
+
+        for m in (16, 4):
+            ref = codec.decode(idx, q_val, layer_idx=1, active_atoms=m, check_bounds=True)
+            tri = triton_lexico_reconstruct(
+                idx, q_val, codec._D_T_fp32[1], active_atoms=m, scale=q_val.scale, out_dtype=torch.float16
+            )
+            cos = F.cosine_similarity(ref.float().reshape(-1, 128), tri.float().reshape(-1, 128), dim=-1).mean().item()
+            self.assertGreater(cos, 0.999999)
+            self.assertLessEqual((ref.float() - tri.float()).abs().max().item(), 5e-3)
+
+        # Verify fused half-split RoPE rotation inside Triton kernel matches PyTorch fallback
+        freqs = torch.outer(torch.arange(256, device="cuda", dtype=torch.float32), torch.linspace(0.01, 1.0, 64, device="cuda"))
+        c_h, s_h = freqs.cos().contiguous(), freqs.sin().contiguous()
+        ref_rope = codec.decode(idx, q_val, layer_idx=1, active_atoms=16, check_bounds=True, rope_cos=c_h, rope_sin=s_h)
+        tri_rope = codec.decode(idx, q_val, layer_idx=1, active_atoms=16, check_bounds=False, rope_cos=c_h, rope_sin=s_h)
+        cos_rope = F.cosine_similarity(ref_rope.float().reshape(-1, 128), tri_rope.float().reshape(-1, 128), dim=-1).mean().item()
+        self.assertGreater(cos_rope, 0.999999)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -186,43 +186,56 @@ class BenchmarkRunner:
             json.dump(self.environment, f, indent=2, default=str)
         self.log(f"Environment saved to {env_path}")
     
+    def _save_csv(self):
+        """Write flattened aggregate results to CSV."""
+        if not self.results:
+            return
+        import csv
+        csv_path = self.output_dir / "results" / "aggregate_results.csv"
+        fieldnames = set()
+        for r in self.results:
+            d = r.to_dict()
+            fieldnames.update(d.keys())
+            fieldnames.update(f"config_{k}" for k in r.config)
+            fieldnames.update(f"metric_{k}" for k in r.metrics)
+        fieldnames = sorted(fieldnames)
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            for r in self.results:
+                row = r.to_dict()
+                row.update({f"config_{k}": v for k, v in r.config.items()})
+                row.update({f"metric_{k}": v for k, v in r.metrics.items()})
+                writer.writerow(row)
+
     def save_results(self):
         """Save all results to JSONL and CSV."""
-        # JSONL
         jsonl_path = self.output_dir / "results" / "raw_results.jsonl"
         with open(jsonl_path, "w") as f:
             for r in self.results:
                 f.write(json.dumps(r.to_dict(), default=str) + "\n")
-        
-        # CSV (flattened)
-        import csv
-        csv_path = self.output_dir / "results" / "aggregate_results.csv"
-        if self.results:
-            # Collect all possible fieldnames first
-            fieldnames = set()
-            for r in self.results:
-                d = r.to_dict()
-                fieldnames.update(d.keys())
-                fieldnames.update({f"config_{k}": v for k, v in r.config.items()})
-                fieldnames.update({f"metric_{k}": v for k, v in r.metrics.items()})
-            
-            fieldnames = sorted(fieldnames)
-            
-            with open(csv_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-                writer.writeheader()
-                for r in self.results:
-                    row = r.to_dict()
-                    row.update({f"config_{k}": v for k, v in r.config.items()})
-                    row.update({f"metric_{k}": v for k, v in r.metrics.items()})
-                    writer.writerow(row)
-        
-        self.log(f"Results saved to {jsonl_path} and {csv_path}")
-    
+        self._save_csv()
+        self.log(f"Results saved to {jsonl_path} and {self.output_dir / 'results' / 'aggregate_results.csv'}")
+
     def add_result(self, result: BenchmarkResult):
-        """Add a result and save incrementally."""
+        """Append a single result incrementally to JSONL."""
         self.results.append(result)
-        self.save_results()
+        jsonl_path = self.output_dir / "results" / "raw_results.jsonl"
+        with open(jsonl_path, "a") as f:
+            f.write(json.dumps(result.to_dict(), default=str) + "\n")
+
+    def add_results(self, results: List[BenchmarkResult]):
+        """Append a batch of results to JSONL and refresh the aggregate CSV once."""
+        if not results:
+            return
+        jsonl_path = self.output_dir / "results" / "raw_results.jsonl"
+        with open(jsonl_path, "a") as f:
+            for r in results:
+                self.results.append(r)
+                f.write(json.dumps(r.to_dict(), default=str) + "\n")
+        self._save_csv()
+        self.log(f"Saved {len(results)} results (total: {len(self.results)})")
     
     # -------------------------------------------------------------------------
     # Model Setup
@@ -261,8 +274,10 @@ class BenchmarkRunner:
         
         self.log(f"Model loaded: {self.model.__class__.__name__} on {next(self.model.parameters()).device}")
         
-        # Load or create calibration artifacts
-        artifacts_path = REPO_ROOT / "artifacts" / "calibrated_artifacts.pt"
+        # Load or create track-specific calibration artifacts
+        track_cfg = self.config["model"][self.model_track]
+        default_rel = "artifacts/calibrated_artifacts.pt" if self.model_track == "fallback" else f"artifacts/calibrated_artifacts_{self.model_track}.pt"
+        artifacts_path = REPO_ROOT / track_cfg.get("artifacts_path", default_rel)
         if artifacts_path.exists():
             self.log(f"Loading calibration artifacts from {artifacts_path}")
             from stoikov_kv.cache import load_or_create_artifacts
@@ -301,6 +316,7 @@ class BenchmarkRunner:
             h2o_context_window=baseline_config.get("h2o_context_window", 1),
         )
     
+    @torch.no_grad()
     def run_inference(
         self,
         cache: StoikovKVCache,
@@ -382,6 +398,7 @@ class BenchmarkRunner:
         
         return torch.tensor(generated, device=device), telemetry
     
+    @torch.no_grad()
     def measure_latency(
         self,
         cache: StoikovKVCache,
@@ -517,10 +534,6 @@ class BenchmarkRunner:
                             # Check if needle was retrieved
                             generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                             retrieved = self._check_needle_retrieval(generated_text, needle_text, distractor_numbers)
-                            
-                            # Get target token probability
-                            cache_for_prob = self.create_cache(baseline_config)
-                            _ = self.run_inference(cache_for_prob, prompt_ids, max_new_tokens=1)
                             
                             metrics = {
                                 "context_length": ctx_len,
@@ -672,17 +685,17 @@ Answers:""",
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(seed)
                     
-                    # Extend prompt to target context length
-                    prompt_text = test_case["prompt"]
-                    prompt_ids = self.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
-                    
-                    # Pad with filler if needed
-                    if prompt_ids.shape[1] < ctx_len:
-                        filler = "Additional context for length padding. " * 100
-                        filler_ids = self.tokenizer(filler, return_tensors="pt", truncation=True, max_length=ctx_len - prompt_ids.shape[1])["input_ids"]
-                        prompt_ids = torch.cat([prompt_ids, filler_ids], dim=1)
-                    
-                    prompt_ids = prompt_ids[:, :ctx_len]
+                    # Extend prompt to target context length, keeping the answer cue at the end
+                    head, sep, tail = test_case["prompt"].rpartition("\n\n")
+                    head_ids = self.tokenizer(head, return_tensors="pt")["input_ids"]
+                    tail_ids = self.tokenizer(sep + tail, return_tensors="pt", add_special_tokens=False)["input_ids"]
+                    pad_len = ctx_len - head_ids.shape[1] - tail_ids.shape[1]
+                    if pad_len > 0:
+                        filler = "\nBackground note: The system logs standard telemetry metrics routinely." * 400
+                        filler_ids = self.tokenizer(filler, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=pad_len)["input_ids"]
+                        prompt_ids = torch.cat([head_ids, filler_ids, tail_ids], dim=1)
+                    else:
+                        prompt_ids = torch.cat([head_ids, tail_ids], dim=1)[:, :ctx_len]
                     
                     cache = self.create_cache(baseline_config)
                     
@@ -732,6 +745,7 @@ Answers:""",
     # Benchmark 3: Context Drift and Adaptation
     # -------------------------------------------------------------------------
     
+    @torch.no_grad()
     def run_context_drift(self, baseline_name: str, baseline_config: Dict[str, Any]) -> List[BenchmarkResult]:
         """Run context drift and adaptation evaluation."""
         results = []
@@ -747,8 +761,8 @@ Answers:""",
         query = "\nQuestion: Earlier, what did Maya fall in? Maya fell in a"
         full_prompt = context + query
         
-        target = "ditch"
-        target_id = self.tokenizer(target, return_tensors="pt")["input_ids"][0, -1].item()
+        target = " ditch"
+        target_id = self.tokenizer(target, return_tensors="pt", add_special_tokens=False)["input_ids"][0, -1].item()
         
         for seed in self.config["benchmark"]["seeds"]:
             torch.manual_seed(seed)
@@ -902,7 +916,8 @@ Answers:""",
         
         for ctx_len in self.config["benchmark"]["context_lengths"]:
             for gen_len in self.config["benchmark"]["generation_lengths"]:
-                for seed in self.config["benchmark"]["seeds"]:
+                # Greedy decoding is deterministic across seeds; 1 seed with multiple timed reps is sufficient.
+                for seed in self.config["benchmark"]["seeds"][:1]:
                     torch.manual_seed(seed)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(seed)
@@ -1049,32 +1064,23 @@ Answers:""",
     # -------------------------------------------------------------------------
     
     def run_ablations(self) -> List[BenchmarkResult]:
-        """Run all ablation experiments."""
+        """Run all ablation experiments, flushing results incrementally per ablation."""
         all_results = []
         
-        ablation_configs = self.config["ablations"]
-        
-        for ablation in ablation_configs:
+        for ablation in self.config["ablations"]:
             name = ablation["name"]
             self.log(f"Running ablation: {name}")
-            
             baseline_config = {k: v for k, v in ablation.items() if k not in ("name", "description")}
             
-            # Run needle retrieval for this ablation
-            needle_results = self.run_needle_retrieval(name, baseline_config)
-            all_results.extend(needle_results)
-            
-            # Run context drift
-            drift_results = self.run_context_drift(name, baseline_config)
-            all_results.extend(drift_results)
-            
-            # Run memory accounting
-            mem_results = self.run_memory_accounting(name, baseline_config)
-            all_results.extend(mem_results)
-            
-            # Run latency
-            lat_results = self.run_latency_throughput(name, baseline_config)
-            all_results.extend(lat_results)
+            for fn in (
+                self.run_needle_retrieval,
+                self.run_context_drift,
+                self.run_memory_accounting,
+                self.run_latency_throughput,
+            ):
+                batch = fn(name, baseline_config)
+                self.add_results(batch)
+                all_results.extend(batch)
         
         return all_results
     
@@ -1096,18 +1102,23 @@ Answers:""",
             if budget >= 1.0:
                 baseline_config = self.config["baselines"]["B0_full_fp16"]
                 results = self.run_needle_retrieval("B0_full_fp16", baseline_config)
+                self.add_results(results)
                 all_results.extend(results)
             
-            # B3: Standalone H2O - adjust keep_ratio
+            # B3: Standalone H2O - match keep_ratio to target budget
             h2o_config = self.config["baselines"]["B3_token_eviction"]["methods"][2].copy()
-            # We'd need to solve for keep_ratio to hit target budget
-            # For now, use the default
-            results = self.run_needle_retrieval("B3_h2o", h2o_config)
+            h2o_config["keep_ratio"] = float(budget)
+            h2o_config["target_budget"] = float(budget)
+            results = self.run_needle_retrieval(f"B3_h2o_b{int(budget*100)}", h2o_config)
+            self.add_results(results)
             all_results.extend(results)
             
-            # B4: StoikovKV Hybrid - adjust keep_ratio and s_budget
+            # B4: StoikovKV Hybrid - scale keep_ratio to hit target memory budget
             hybrid_config = self.config["baselines"]["B4_stoikovkv_hybrid"].copy()
-            results = self.run_needle_retrieval("B4_stoikovkv", hybrid_config)
+            hybrid_config["keep_ratio"] = round(max(0.05, min(1.0, float(budget) - 0.10)), 3)
+            hybrid_config["target_budget"] = float(budget)
+            results = self.run_needle_retrieval(f"B4_stoikovkv_b{int(budget*100)}", hybrid_config)
+            self.add_results(results)
             all_results.extend(results)
         
         return all_results
@@ -1116,11 +1127,17 @@ Answers:""",
     # Main Run Method
     # -------------------------------------------------------------------------
     
-    def run_all(self):
-        """Run all benchmarks."""
+    def run_all(self, benchmarks: Optional[List[str]] = None):
+        """Run selected benchmarks (defaults to all)."""
+        selected = set(benchmarks or ["all"])
+        run_everything = "all" in selected
+
         self.log("=" * 60)
         self.log("Starting StoikovKV Comparative Audit Benchmark")
         self.log("=" * 60)
+        
+        # Start fresh JSONL file for this run
+        (self.output_dir / "results" / "raw_results.jsonl").write_text("")
         
         self.save_environment()
         self.setup_model()
@@ -1130,75 +1147,52 @@ Answers:""",
             "B0_full_fp16": self.config["baselines"]["B0_full_fp16"],
             "B3_standalone_h2o": self.config["baselines"]["B3_token_eviction"]["methods"][2],
             "B4_stoikovkv_hybrid": self.config["baselines"]["B4_stoikovkv_hybrid"],
+            "B3_standalone_lexico": {
+                "policy_mode": "standalone_lexico",
+                "n_b": 64,
+                "keep_ratio": 1.0,
+                "s_budget": 14,
+                "enable_hmm_decay": False,
+            },
         }
         
-        # Add standalone Lexico if configured
-        baselines["B3_standalone_lexico"] = {
-            "policy_mode": "standalone_lexico",
-            "n_b": 64,
-            "keep_ratio": 1.0,
-            "s_budget": 14,
-            "enable_hmm_decay": False,
-        }
+        baseline_suite = [
+            ("needle", "needle retrieval", self.run_needle_retrieval),
+            ("long_context", "long-context quality", self.run_long_context_quality),
+            ("drift", "context drift", self.run_context_drift),
+            ("memory", "memory accounting", self.run_memory_accounting),
+            ("latency", "latency/throughput", self.run_latency_throughput),
+        ]
         
         # Run main benchmarks for each baseline
-        for name, config in baselines.items():
-            self.log(f"\n{'='*60}")
-            self.log(f"Testing baseline: {name}")
-            self.log(f"{'='*60}")
-            
-            # Needle retrieval
-            self.log("Running needle retrieval benchmark...")
-            results = self.run_needle_retrieval(name, config)
-            for r in results:
-                self.add_result(r)
-            
-            # Long-context quality
-            self.log("Running long-context quality benchmark...")
-            results = self.run_long_context_quality(name, config)
-            for r in results:
-                self.add_result(r)
-            
-            # Context drift
-            self.log("Running context drift benchmark...")
-            results = self.run_context_drift(name, config)
-            for r in results:
-                self.add_result(r)
-            
-            # Memory accounting
-            self.log("Running memory accounting benchmark...")
-            results = self.run_memory_accounting(name, config)
-            for r in results:
-                self.add_result(r)
-            
-            # Latency and throughput
-            self.log("Running latency/throughput benchmark...")
-            results = self.run_latency_throughput(name, config)
-            for r in results:
-                self.add_result(r)
-            
-            # Encoder quality (for Lexico methods)
-            if config.get("policy_mode") in ("hybrid", "standalone_lexico"):
-                self.log("Running encoder quality benchmark...")
-                results = self.run_encoder_quality(name, config)
-                for r in results:
-                    self.add_result(r)
+        if run_everything or selected.intersection({"needle", "long_context", "drift", "memory", "latency", "encoder"}):
+            for name, config in baselines.items():
+                self.log(f"\n{'='*60}")
+                self.log(f"Testing baseline: {name}")
+                self.log(f"{'='*60}")
+                
+                for key, label, fn in baseline_suite:
+                    if run_everything or key in selected:
+                        self.log(f"Running {label} benchmark...")
+                        self.add_results(fn(name, config))
+                
+                if (run_everything or "encoder" in selected) and config.get("policy_mode") in ("hybrid", "standalone_lexico"):
+                    self.log("Running encoder quality benchmark...")
+                    self.add_results(self.run_encoder_quality(name, config))
         
         # Run ablations
-        self.log("\n" + "=" * 60)
-        self.log("Running ablation experiments...")
-        self.log("=" * 60)
-        ablation_results = self.run_ablations()
-        for r in ablation_results:
-            self.add_result(r)
+        if run_everything or "ablation" in selected:
+            self.log("\n" + "=" * 60)
+            self.log("Running ablation experiments...")
+            self.log("=" * 60)
+            self.run_ablations()
         
         # Run equal memory budget comparison
-        self.log("\n" + "=" * 60)
-        self.log("Running equal memory budget comparison...")
-        self.log("=" * 60)
-        eq_results = self.run_equal_memory_budget()
-        for r in eq_results:
-            self.add_result(r)
+        if run_everything or "equal_budget" in selected:
+            self.log("\n" + "=" * 60)
+            self.log("Running equal memory budget comparison...")
+            self.log("=" * 60)
+            self.run_equal_memory_budget()
         
         self.log("\n" + "=" * 60)
         self.log("All benchmarks completed!")
@@ -1263,6 +1257,8 @@ def main():
                         choices=["needle", "long_context", "drift", "memory", "latency", "encoder", "ablation", "equal_budget", "all"],
                         default=["all"],
                         help="Specific benchmarks to run")
+    parser.add_argument("--quick", action="store_true",
+                        help="Run a faster reduced-grid pass (fewer context/gen lengths, seeds, and timing reps)")
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
     
     args = parser.parse_args()
@@ -1274,8 +1270,17 @@ def main():
         verbose=not args.quiet,
     )
     
+    if args.quick:
+        runner.config["benchmark"]["context_lengths"] = [512, 2048]
+        runner.config["benchmark"]["generation_lengths"] = [32, 64]
+        runner.config["benchmark"]["seeds"] = [42]
+        runner.config["benchmark"]["warmup_iterations"] = 1
+        runner.config["benchmark"]["timing_iterations"] = 2
+        runner.config["datasets"]["needle_retrieval"]["context_lengths"] = [512, 2048]
+        runner.config["datasets"]["needle_retrieval"]["num_trials"] = 2
+    
     try:
-        runner.run_all()
+        runner.run_all(benchmarks=args.benchmarks)
     except KeyboardInterrupt:
         runner.log("Benchmark interrupted by user", "WARNING")
         runner.save_results()

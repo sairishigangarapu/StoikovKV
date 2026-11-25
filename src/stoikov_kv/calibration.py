@@ -1116,12 +1116,12 @@ def load_model_and_tokenizer(
         
         # Adjust max_memory based on model size and quantization
         if load_in_4bit or use_quanto:
-            max_memory = {0: "5GB"} if use_cuda else None
+            max_memory = {0: "6.5GiB"} if use_cuda else None
         else:
             # For 1.5B FP16 ~3.5GB, for 7B FP16 ~14GB, for 7B 8-bit ~7GB
             is_7b = "7b" in model_name.lower() or "7B" in model_name
             if is_7b and not (load_in_4bit or use_quanto):
-                max_memory = {0: "7GB", "cpu": "20GB"} if use_cuda else None
+                max_memory = {0: "5.5GiB", "cpu": "3.5GiB"} if use_cuda else None
             else:
                 max_memory = {0: "5.5GB"} if use_cuda else None
         
@@ -1151,6 +1151,11 @@ def load_model_and_tokenizer(
         }
         if quantization_config is not None:
             model_kwargs["quantization_config"] = quantization_config
+        if "7b" in model_name.lower() and not (load_in_4bit or use_quanto) and use_cuda:
+            offload_dir = os.path.abspath(".offload_7b_cache")
+            os.makedirs(offload_dir, exist_ok=True)
+            model_kwargs["offload_folder"] = offload_dir
+            model_kwargs["offload_state_dict"] = True
         
         model = AutoModelForCausalLM.from_pretrained(
             resolved_model_path,

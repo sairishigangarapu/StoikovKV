@@ -39,6 +39,8 @@ os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_stoikov")
 import torch
 import torch.nn.functional as F
 
+from .triton_kernels import can_use_triton, triton_lexico_reconstruct
+
 MAX_INT16_ATOMS: int = 32767
 
 
@@ -115,6 +117,7 @@ class QuantizedInt8Values(torch.Tensor):
 
 def quantize_sorted_atoms(
     y_sorted: torch.Tensor,
+    validate_finite: bool = True,
 ) -> QuantizedInt8Values:
     """
     Symmetric per-vector int8 quantizer for sorted sparse atom coefficients `y_sorted` (`[..., s]`):
@@ -124,7 +127,7 @@ def quantize_sorted_atoms(
       - For exact zero vectors (`max_abs == 0`):
             scale_fp16 = 0.0, q_int8 = 0 (guaranteed finite, exact zero reconstruction).
     """
-    if not torch.isfinite(y_sorted).all():
+    if validate_finite and not torch.isfinite(y_sorted).all():
         raise ValueError("Cannot quantize non-finite atom coefficients.")
 
     max_abs = y_sorted.to(torch.float32).abs().amax(dim=-1, keepdim=True)
@@ -277,6 +280,7 @@ class ElasticLexicoCodec:
             if not torch.isfinite(W_ridge).all():
                 raise ValueError("W_ridge contains non-finite values.")
             self.W_ridge = W_ridge.to(device=self.device, dtype=self.dtype)
+        self._W_ridge_T_fp32 = self.W_ridge.transpose(1, 2).contiguous().to(torch.float32)
 
     @classmethod
     def from_artifacts(
@@ -432,6 +436,10 @@ class ElasticLexicoCodec:
             d_layer_t = self.D[layer_idx].transpose(0, 1).to(
                 device=float_values.device, dtype=float_values.dtype
             )  # [n_atoms, head_dim]
+        if can_use_triton(d_layer_t) and indices.device == d_layer_t.device:
+            return triton_lexico_reconstruct(
+                indices, float_values, d_layer_t, out_dtype=float_values.dtype
+            )
         atoms = F.embedding(indices.to(torch.long), d_layer_t)  # [..., m, head_dim]
         return (atoms * float_values.unsqueeze(-1)).sum(dim=-2)  # [..., head_dim]
 
@@ -463,7 +471,14 @@ class ElasticLexicoCodec:
             raise ValueError(f"lambda1 must be >= 0, got {lambda1}.")
 
         x_fp32 = X.to(device=self.device, dtype=torch.float32)
-        w_ridge_t = self.W_ridge[layer_idx].T.to(torch.float32)  # [head_dim, n_atoms]
+        if (
+            hasattr(self, "_W_ridge_T_fp32")
+            and self._W_ridge_T_fp32.device == x_fp32.device
+            and tuple(self._W_ridge_T_fp32.shape) == (self.num_layers, self.head_dim, self.n_atoms)
+        ):
+            w_ridge_t = self._W_ridge_T_fp32[layer_idx]
+        else:
+            w_ridge_t = self.W_ridge[layer_idx].T.to(device=x_fp32.device, dtype=torch.float32)
 
         x_norm = torch.norm(x_fp32, p=2, dim=-1, keepdim=True)
         is_zero_vec = x_norm <= 1e-8
@@ -484,8 +499,7 @@ class ElasticLexicoCodec:
 
         # If all entries of a non-zero vector were thresholded to zero, fall back to unthresholded Z
         all_zero_non_trivial = (Y.abs().amax(dim=-1, keepdim=True) <= 1e-8) & (~is_zero_vec)
-        if torch.any(all_zero_non_trivial):
-            Y = torch.where(all_zero_non_trivial, Z, Y)
+        Y = torch.where(all_zero_non_trivial, Z, Y)
 
         # 3. Select top-s atoms sorted in descending magnitude order
         _, top_indices = torch.topk(Y.abs(), k=s, dim=-1, largest=True, sorted=True)
@@ -512,7 +526,7 @@ class ElasticLexicoCodec:
         y_sorted = y_sorted * safe_scale
 
         indices_int16 = top_indices.to(dtype=torch.int16, device=X.device)
-        q_values = quantize_sorted_atoms(y_sorted.to(device=X.device))
+        q_values = quantize_sorted_atoms(y_sorted.to(device=X.device), validate_finite=validate_finite)
         return indices_int16, q_values
 
     def omp_encode(
@@ -687,6 +701,8 @@ class ElasticLexicoCodec:
         active_atoms: Optional[int] = None,
         scale: Optional[torch.Tensor] = None,
         check_bounds: bool = True,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Full and Nested Partial Sparse Decoder:
@@ -711,6 +727,29 @@ class ElasticLexicoCodec:
                 )
         else:
             m = s_total
+
+        # Fast fused Triton path on CUDA (zero intermediate [N, m, head_dim] HBM allocation)
+        has_valid_cache_d = (
+            hasattr(self, "_D_T_fp32")
+            and self._D_T_fp32.device == self.device
+            and tuple(self._D_T_fp32.shape) == (self.num_layers, self.n_atoms, self.head_dim)
+        )
+        if not check_bounds and has_valid_cache_d and can_use_triton(self._D_T_fp32) and indices.device == self.device:
+            d_l = self._D_T_fp32[layer_idx]
+            if isinstance(values, QuantizedInt8Values) and values.device == self.device:
+                sc = scale if scale is not None else values.scale
+                return triton_lexico_reconstruct(
+                    indices, values, d_l, active_atoms=m, scale=sc, rope_cos=rope_cos, rope_sin=rope_sin, out_dtype=self.dtype
+                )
+            if isinstance(values, tuple) and values[0].device == self.device:
+                return triton_lexico_reconstruct(
+                    indices, values[0], d_l, active_atoms=m, scale=values[1], rope_cos=rope_cos, rope_sin=rope_sin, out_dtype=self.dtype
+                )
+            if isinstance(values, torch.Tensor) and values.device == self.device:
+                sc = scale if scale is not None else getattr(values, "scale", None)
+                return triton_lexico_reconstruct(
+                    indices, values, d_l, active_atoms=m, scale=sc, rope_cos=rope_cos, rope_sin=rope_sin, out_dtype=self.dtype
+                )
 
         idx_m = indices[..., :m].to(device=self.device, dtype=torch.long)
         if check_bounds and (int(idx_m.min().item()) < 0 or int(idx_m.max().item()) >= self.n_atoms):
@@ -740,6 +779,14 @@ class ElasticLexicoCodec:
                 val_m = raw_m
 
         x_hat = self._raw_reconstruct(idx_m, val_m, layer_idx=layer_idx)
+        if rope_cos is not None and rope_sin is not None:
+            t_len = int(x_hat.shape[-2])
+            half = int(x_hat.shape[-1]) // 2
+            c_h = rope_cos[:t_len, :half].to(device=x_hat.device, dtype=torch.float32)
+            s_h = rope_sin[:t_len, :half].to(device=x_hat.device, dtype=torch.float32)
+            xf = x_hat.float()
+            x_lo, x_hi = xf[..., :half], xf[..., half:]
+            x_hat = torch.cat((x_lo * c_h - x_hi * s_h, x_hi * c_h + x_lo * s_h), dim=-1)
         return x_hat.to(device=indices.device, dtype=self.dtype)
 
     def adapt_online_atoms(

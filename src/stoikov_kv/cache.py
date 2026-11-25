@@ -61,6 +61,10 @@ from .elastic_lexico import (
     QuantizedInt8Values,
     quantize_sorted_atoms,
 )
+from .hikvp import (
+    HiKVPConfig,
+    HiKVPStore,
+)
 
 # ============================================================================
 # DynamicCache Base Class (HuggingFace Transformers + Standalone Compatibility)
@@ -492,32 +496,59 @@ def load_or_create_artifacts(
 # ============================================================================
 
 
+def stoikov_control_step(
+    inventory_q: float,
+    sigma_sq: float,
+    gamma_risk: float = 0.5,
+    kappa_arrival: float = 1.5,
+) -> Tuple[float, float]:
+    """
+    Exact Avellaneda-Stoikov (2008) reservation skew & optimal half-spread:
+        skew = q_t * gamma * sigma_t^2
+        delta* = 0.5 * gamma * sigma_t^2 + (1 / gamma) * ln(1 + gamma / kappa)
+    """
+    g = max(float(gamma_risk), 1e-4)
+    k = max(float(kappa_arrival), 1e-4)
+    s2 = max(float(sigma_sq), 0.0)
+    skew = float(inventory_q) * g * s2
+    half_spread = 0.5 * g * s2 + (1.0 / g) * math.log(1.0 + g / k)
+    return skew, half_spread
+
+
 @dataclass
 class OnlineRegimeChangeController:
     """
-    Online EMA Centroid/Deviation Regime-Change Decay Controller for StoikovKV
+    Online Avellaneda-Stoikov Inventory & Regime-Change Controller for StoikovKV
     (exported with legacy alias `HMMTopicShiftController`):
-    - Computes normalized subspace/value features at write time (`output_attentions=False`).
-    - Tracks an exponential moving average (EMA) of the feature centroid and deviation.
-      When a topic shift (e.g., Turn-1 Python/Config -> Turn-2 CSS styling) produces a
-      normalized drift z-score > `shift_z_threshold` (`1.4`), pulses the heavy-hitter
-      decay factor (`beta_t = beta_shift = 0.65` vs stationary `beta_stationary = 0.99`)
-      so stale Turn-1 heavy hitters decay rapidly.
+    - Tracks EMA centroid and instantaneous drift volatility `sigma_t^2 = ema_dev^2`.
+    - Computes normalized KV inventory pressure `q_t = clip((L_t - L_target) / L_target, -1, 1)`
+      and applies the Avellaneda-Stoikov reservation skew `q_t * gamma * sigma_t^2` and optimal
+      half-spread `delta*` to adapt `keep_ratio` smoothly (retaining more heavy hitters when
+      VRAM headroom `q_t < 0` is ample, and tightening back to `keep_ratio` as `q_t -> +1`).
+    - Triggers a single-step shift decay (`beta_t = beta_shift = 0.65`) on regime shifts (`z > 1.4`).
     """
 
-    beta_stationary: float = 0.99
+    beta_stationary: float = 1.0
     beta_shift: float = 0.65
     keep_ratio: float = 0.20
     s_budget: int = 16
     shift_z_threshold: float = 1.4
     ema_alpha: float = 0.15
     enable_hmm_decay: bool = True
+    enable_stoikov_control: bool = True
+    gamma_risk: float = 0.5
+    kappa_arrival: float = 1.5
+    inventory_target_tokens: int = 2048
 
     # Telemetry state
     ema_centroid: Optional[torch.Tensor] = None
     ema_dev: float = 0.05
     last_z_score: float = 0.0
-    last_beta_t: float = 0.995
+    last_beta_t: float = 1.0
+    last_inventory_q: float = 0.0
+    last_reservation_skew: float = 0.0
+    last_half_spread: float = 0.0
+    last_keep_ratio: float = 0.20
     shift_events: int = 0
     step_history: List[Dict[str, float]] = field(default_factory=list)
 
@@ -526,8 +557,38 @@ class OnlineRegimeChangeController:
         self.ema_dev = 0.05
         self.last_z_score = 0.0
         self.last_beta_t = self.beta_stationary if self.enable_hmm_decay else 1.0
+        self.last_inventory_q = 0.0
+        self.last_reservation_skew = 0.0
+        self.last_half_spread = 0.0
+        self.last_keep_ratio = self.keep_ratio
         self.shift_events = 0
         self.step_history.clear()
+
+    def compute_dynamic_keep_ratio(self, seq_len: int) -> float:
+        """Evaluates the Avellaneda-Stoikov inventory-modulated retention ratio `keep_ratio_t`."""
+        if not self.enable_stoikov_control:
+            self.last_keep_ratio = self.keep_ratio
+            return self.keep_ratio
+        target = float(max(128, self.inventory_target_tokens))
+        q_t = max(-1.0, min(1.0, (float(seq_len) - target) / target))
+        sigma_sq = float(self.ema_dev * self.ema_dev)
+        skew, half_spread = stoikov_control_step(
+            q_t, sigma_sq, gamma_risk=self.gamma_risk, kappa_arrival=self.kappa_arrival
+        )
+        self.last_inventory_q = q_t
+        self.last_reservation_skew = skew
+        self.last_half_spread = half_spread
+
+        k0 = float(self.keep_ratio)
+        if q_t < 0.0:
+            # Below target inventory (excess VRAM headroom): relax admission smoothly up to min(0.55, 3*k0)
+            bonus = -0.35 * q_t * math.tanh(half_spread) - skew
+            k_dyn = max(k0, min(min(0.55, 3.0 * k0), k0 + bonus))
+        else:
+            # At/above target inventory: tighten by reservation skew while respecting a safe floor
+            k_dyn = max(max(0.08, 0.65 * k0), min(k0, k0 - skew))
+        self.last_keep_ratio = float(k_dyn)
+        return self.last_keep_ratio
 
     @torch.no_grad()
     def observe_and_query(
@@ -537,18 +598,20 @@ class OnlineRegimeChangeController:
     ) -> Tuple[float, float, int]:
         """
         Observes normalized query-subspace projection energy `proj_energy` (`[r]` or `[H, r]`)
-        and returns `(beta_t, keep_ratio, s_budget)`.
+        and returns `(beta_t, keep_ratio_t, s_budget)`.
         """
         if not self.enable_hmm_decay:
             self.last_beta_t = 1.0
-            return 1.0, self.keep_ratio, self.s_budget
+            k_dyn = self.compute_dynamic_keep_ratio(seq_len)
+            return 1.0, k_dyn, self.s_budget
 
         feat = F.normalize(proj_energy.detach().float().flatten(), p=2.0, dim=0, eps=1e-8)
         if self.ema_centroid is None or self.ema_centroid.shape != feat.shape:
             self.ema_centroid = feat.clone()
             self.last_z_score = 0.0
             self.last_beta_t = self.beta_stationary
-            return self.beta_stationary, self.keep_ratio, self.s_budget
+            k_dyn = self.compute_dynamic_keep_ratio(seq_len)
+            return self.beta_stationary, k_dyn, self.s_budget
 
         diff = float(torch.norm(feat - self.ema_centroid, p=2.0).item())
         z_score = diff / max(self.ema_dev, 1e-4)
@@ -570,14 +633,16 @@ class OnlineRegimeChangeController:
             beta_t = self.beta_stationary
 
         self.last_beta_t = beta_t
+        k_dyn = self.compute_dynamic_keep_ratio(seq_len)
         self.step_history.append(
             {
                 "seq_len": float(seq_len),
                 "z_score": float(z_score),
                 "beta_t": float(beta_t),
+                "keep_ratio_t": float(k_dyn),
             }
         )
-        return beta_t, self.keep_ratio, self.s_budget
+        return beta_t, k_dyn, self.s_budget
 
 
 # Backward-compatible alias for legacy callers and unit tests
@@ -721,6 +786,21 @@ def _ensure_hf_sdpa_compact_mask_support() -> bool:
             if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4:
                 if attention_mask.shape[-1] > kv_len:
                     attention_mask = attention_mask[..., -kv_len:]
+                elif attention_mask.shape[-1] < kv_len:
+                    pad_prefix = kv_len - int(attention_mask.shape[-1])
+                    if attention_mask.dtype == torch.bool:
+                        prefix_mask = torch.ones(
+                            (*attention_mask.shape[:-1], pad_prefix),
+                            dtype=torch.bool,
+                            device=attention_mask.device,
+                        )
+                    else:
+                        prefix_mask = torch.zeros(
+                            (*attention_mask.shape[:-1], pad_prefix),
+                            dtype=attention_mask.dtype,
+                            device=attention_mask.device,
+                        )
+                    attention_mask = torch.cat([prefix_mask, attention_mask], dim=-1)
             elif attention_mask is None and q_len > 1 and kv_len > q_len:
                 q_idx = torch.arange(q_len, device=query.device).unsqueeze(1)
                 k_idx = torch.arange(kv_len, device=query.device).unsqueeze(0)
@@ -776,6 +856,8 @@ class StoikovKVCache(DynamicCache):
         max_rollback_window: int = 32,
         h2o_context_window: int = 0,
         cache_lexico_reconstructions: bool = False,
+        hikvp_config: Optional[HiKVPConfig] = None,
+        atlas_bank: Optional[Any] = None,
     ) -> None:
         # Initialize HF DynamicCache with config=None so DynamicCache does not allocate
         # duplicate uncompressed DynamicLayer objects across all layers.
@@ -800,9 +882,21 @@ class StoikovKVCache(DynamicCache):
                 raise ValueError("Either `model` or `artifacts` must be provided to StoikovKVCache.")
             artifacts = load_or_create_artifacts(model, artifacts_path=artifacts_path)
 
+        model_dev: Optional[torch.device] = None
+        if model is not None:
+            try:
+                model_dev = next(model.parameters()).device
+            except StopIteration:
+                model_dev = None
+
         self.U_Q: torch.Tensor = artifacts["U_Q"]
         self.D: torch.Tensor = artifacts["D"]
         self.W_ridge: torch.Tensor = artifacts["W_ridge"]
+        if model_dev is not None and model_dev.type == "cuda":
+            self.U_Q = self.U_Q.to(device=model_dev)
+            self.D = self.D.to(device=model_dev)
+            self.W_ridge = self.W_ridge.to(device=model_dev)
+        self._u_q_fp32: torch.Tensor = self.U_Q.to(dtype=torch.float32).contiguous()
         base_roles: torch.Tensor = artifacts["head_roles"].clone().long()
 
         self.num_layers: int = int(self.U_Q.shape[0])
@@ -865,22 +959,55 @@ class StoikovKVCache(DynamicCache):
         )
         self._rope_cos_cache: Optional[torch.Tensor] = None
         self._rope_sin_cache: Optional[torch.Tensor] = None
+        self._rope_cos_half: Optional[torch.Tensor] = None
+        self._rope_sin_half: Optional[torch.Tensor] = None
         self._rope_cache_len: int = 0
         self._rope_cache_dev: Optional[torch.device] = None
+        is_hybrid = self.policy_mode in ("hybrid", "stoikov", "stoikov_hybrid")
         self.controller = controller or OnlineRegimeChangeController(
             keep_ratio=self.keep_ratio,
             s_budget=self.s_budget,
             enable_hmm_decay=enable_hmm_decay,
+            enable_stoikov_control=(is_hybrid and bool(enable_hmm_decay)),
         )
         self.controller_fn = controller_fn
 
+        # Precomputed per-layer role homogeneity flags (avoids per-token GPU/CPU .item() syncs)
+        self._layer_all_fp16: List[bool] = [
+            bool(torch.all(self.head_roles[l] == ROLE_RETRIEVAL_FP16).item())
+            for l in range(self.num_layers)
+        ]
+        self._layer_all_h2o: List[bool] = [
+            bool(torch.all(self.head_roles[l] == ROLE_PEAKED_H2O).item())
+            for l in range(self.num_layers)
+        ]
+        self._layer_all_lexico: List[bool] = [
+            bool(torch.all(self.head_roles[l] == ROLE_DIFFUSE_LEXICO).item())
+            for l in range(self.num_layers)
+        ]
+
+        # Batch-flush stride during 1-token decode: stage up to `n_b + _decode_flush_stride`
+        # local tokens and flush `_decode_flush_stride` tokens in one vectorized batch.
+        self._decode_flush_stride: int = max(1, min(64, self.n_b))
+
         # Per-layer state
         self._layer_seq_len: List[int] = [0 for _ in range(self.num_layers)]
-        # Recent uncompressed FP16 sliding window [batch, num_kv_heads, win_len <= n_b, head_dim]
+        # Recent uncompressed FP16 sliding window [batch, num_kv_heads, win_len, head_dim]
         self._local_k: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
         self._local_v: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
         self._local_scores: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
         self._local_positions: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+
+        # Pre-allocated in-place slab backing `_local_*` during 1-token decode (zero torch.cat)
+        self._local_buf_k: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+        self._local_buf_v: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+        self._local_buf_sc: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+        self._local_buf_pos: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+
+        # Cached stacked history views for pure-FP16 and pure-H2O layers (shared storage, zero extra VRAM)
+        self._layer_compact_k: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+        self._layer_compact_v: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+        self._layer_compact_bytes: List[int] = [0 for _ in range(self.num_layers)]
 
         # Rollback ring buffer storing recently flushed tokens from the local window so
         # speculative `crop(max_length)` is 100% lossless even across local window boundaries
@@ -912,6 +1039,164 @@ class StoikovKVCache(DynamicCache):
             "diffuse_lexico_sparse": 0,
             "evicted_h2o": 0,
         }
+
+        # Optional AtlasKV-inspired HiKVP hierarchical offloaded retrieval & persistent Atlas bank
+        self.hikvp_config: Optional[HiKVPConfig] = hikvp_config
+        self.hikvp_store: Optional[HiKVPStore] = (
+            HiKVPStore(
+                num_layers=self.num_layers,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                head_roles=self.head_roles,
+                config=hikvp_config,
+                U_Q=self.U_Q,
+            )
+            if hikvp_config is not None
+            else None
+        )
+        self.atlas_bank: Optional[Any] = atlas_bank
+        self._query_hook_handles: List[Any] = []
+        self._latest_pre_rope_q: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+        self._atlas_retrievals: int = 0
+        self._atlas_tokens_retrieved: int = 0
+        self._atlas_pcie_bytes: int = 0
+        self._draft_pcie_bytes: int = 0
+
+    def set_hikvp_draft_mode(self, enabled: bool) -> None:
+        """
+        Toggles zero-PCIe draft mode on any attached `HiKVPStore` (and `AtlasMemoryBank` store).
+        During Matryoshka speculative drafting, leaf fetches from CPU/NVMe are suppressed so PCIe
+        transfers are amortized across the batched parallel verification pass.
+        """
+        if self.hikvp_store is not None:
+            self.hikvp_store.set_draft_mode(bool(enabled))
+        if self.atlas_bank is not None and hasattr(self.atlas_bank, "store") and self.atlas_bank.store is not None:
+            self.atlas_bank.store.set_draft_mode(bool(enabled))
+
+    def set_atlas_bank(self, bank: Optional[Any]) -> None:
+        """Attaches or detaches a persistent `AtlasMemoryBank` for Rectangular Attention."""
+        self.atlas_bank = bank
+
+    def attach_query_hooks(self, model: nn.Module) -> None:
+        """
+        Registers lightweight forward hooks on each layer's `self_attn.q_proj` to capture live
+        position-free pre-RoPE queries (`[B, H_kv, Q, D]`, mean-pooled per GQA group) for HiKVP
+        hierarchical centroid pruning and layer-pipelined async prefetching. Remains 100%
+        FlashAttention/SDPA-compatible (`output_attentions=False`).
+        """
+        self.detach_query_hooks()
+        inner = getattr(model, "model", model)
+        layers = getattr(inner, "layers", None)
+        if layers is None:
+            layers = getattr(model, "layers", None)
+        if layers is None:
+            raise ValueError("Cannot attach query hooks: model exposes neither `.model.layers` nor `.layers`.")
+
+        num_kv = self.num_kv_heads
+        d_head = self.head_dim
+
+        for l_idx, layer in enumerate(layers):
+            if l_idx >= self.num_layers:
+                break
+            attn = getattr(layer, "self_attn", None)
+            q_proj = getattr(attn, "q_proj", None) if attn is not None else None
+            if q_proj is None:
+                continue
+
+            def _make_q_hook(layer_index: int):
+                def _hook(_mod: nn.Module, _inp: Any, out: torch.Tensor) -> None:
+                    q_t = out[0] if isinstance(out, tuple) else out
+                    if not isinstance(q_t, torch.Tensor) or q_t.dim() != 3:
+                        return
+                    bsz_q, q_len_q, total_dim = q_t.shape
+                    if total_dim % d_head != 0:
+                        return
+                    n_q_heads = total_dim // d_head
+                    if n_q_heads == num_kv:
+                        q_kv = q_t.detach().view(bsz_q, q_len_q, num_kv, d_head).transpose(1, 2)
+                    elif n_q_heads > num_kv and n_q_heads % num_kv == 0:
+                        # Preserve all GQA query heads in the query axis [B, H_kv, g * Q, D]
+                        # so HiKVP max-pooling across queries lets a single sharp retrieval head
+                        # vote directly without being diluted by mean-pooling other query heads.
+                        g_size = n_q_heads // num_kv
+                        q_kv = (
+                            q_t.detach()
+                            .view(bsz_q, q_len_q, num_kv, g_size, d_head)
+                            .permute(0, 2, 1, 3, 4)
+                            .reshape(bsz_q, num_kv, q_len_q * g_size, d_head)
+                        )
+                    else:
+                        q_kv = (
+                            q_t.detach()
+                            .view(bsz_q, q_len_q, n_q_heads, d_head)
+                            .mean(dim=2, keepdim=True)
+                            .expand(bsz_q, q_len_q, num_kv, d_head)
+                            .transpose(1, 2)
+                        )
+                    self._latest_pre_rope_q[layer_index] = q_kv
+
+                    # Layer-pipelined async prefetch for the next layer when not in draft mode
+                    if (
+                        self.hikvp_store is not None
+                        and self.hikvp_config is not None
+                        and self.hikvp_config.async_prefetch
+                        and not self.hikvp_store.draft_mode
+                        and (layer_index + 1) < self.num_layers
+                    ):
+                        self.hikvp_store.prefetch_layer(
+                            layer_idx=layer_index + 1,
+                            query_pre_rope=q_kv,
+                            device=q_kv.device,
+                            dtype=q_kv.dtype,
+                        )
+
+                return _hook
+
+            self._query_hook_handles.append(q_proj.register_forward_hook(_make_q_hook(l_idx)))
+
+    def detach_query_hooks(self) -> None:
+        """Removes all registered `q_proj` forward hooks and clears cached pre-RoPE queries."""
+        for handle in self._query_hook_handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._query_hook_handles.clear()
+        self._latest_pre_rope_q = [None for _ in range(self.num_layers)]
+
+    def hikvp_telemetry(self) -> Dict[str, Any]:
+        """Returns HiKVP offload + AtlasMemoryBank Rectangular Attention telemetry."""
+        if self.hikvp_store is None and self.atlas_bank is None and self._atlas_retrievals == 0:
+            return {}
+        tel: Dict[str, Any] = dict(self.hikvp_store.telemetry()) if self.hikvp_store is not None else {}
+        tel["draft_pcie_bytes"] = int(self._draft_pcie_bytes)
+        tel["atlas_attached"] = self.atlas_bank is not None
+        tel["atlas_retrievals"] = int(self._atlas_retrievals)
+        tel["atlas_tokens_retrieved"] = int(self._atlas_tokens_retrieved)
+        tel["atlas_pcie_bytes"] = int(self._atlas_pcie_bytes)
+        if self.atlas_bank is not None and hasattr(self.atlas_bank, "stats"):
+            tel["atlas_bank_stats"] = self.atlas_bank.stats()
+        return tel
+
+    def _get_pre_rope_query_for_layer(
+        self,
+        layer_idx: int,
+        local_k: torch.Tensor,
+        local_pos: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Returns live pre-RoPE query `[B, H_kv, Q, D]` captured via `attach_query_hooks`, or
+        falls back cleanly to un-rotated recent local keys when hooks are not installed.
+        """
+        bsz = int(local_k.shape[0])
+        q_cached = self._latest_pre_rope_q[layer_idx]
+        if q_cached is not None and int(q_cached.shape[0]) == bsz:
+            return q_cached
+        win_len = int(local_k.shape[-2])
+        tail_n = min(4, win_len)
+        k_tail = local_k[:, :, -tail_n:, :]
+        pos_tail = local_pos[-tail_n:] if local_pos is not None else None
+        return self._rope_rotate(k_tail, pos_tail, inverse=True, force=True)
 
     def set_matryoshka_mode(self, active_atoms: int) -> None:
         """
@@ -1008,6 +1293,12 @@ class StoikovKVCache(DynamicCache):
     @torch.no_grad()
     def _apply_batch_index(self, idx: torch.Tensor) -> None:
         for l_idx in range(self.num_layers):
+            self._local_buf_k[l_idx] = None
+            self._local_buf_v[l_idx] = None
+            self._local_buf_sc[l_idx] = None
+            self._local_buf_pos[l_idx] = None
+            self._layer_compact_k[l_idx] = None
+            self._layer_compact_v[l_idx] = None
             if self._local_k[l_idx] is not None:
                 dev = self._local_k[l_idx].device
                 b_idx = idx.to(dev)
@@ -1077,16 +1368,17 @@ class StoikovKVCache(DynamicCache):
             inv_freq = self._rope_inv_freq.to(device=device)
             pos_vec = torch.arange(cap, device=device, dtype=torch.float32)
             freqs = torch.outer(pos_vec, inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            self._rope_cos_cache = emb.cos()
-            self._rope_sin_cache = emb.sin()
+            self._rope_cos_half = freqs.cos().contiguous()
+            self._rope_sin_half = freqs.sin().contiguous()
+            self._rope_cos_cache = torch.cat((self._rope_cos_half, self._rope_cos_half), dim=-1)
+            self._rope_sin_cache = torch.cat((self._rope_sin_half, self._rope_sin_half), dim=-1)
             self._rope_cache_len = cap
             self._rope_cache_dev = device
         return self._rope_cos_cache, self._rope_sin_cache
 
     @torch.no_grad()
     def _rope_rotate(
-        self, x: torch.Tensor, positions: Optional[torch.Tensor], inverse: bool
+        self, x: torch.Tensor, positions: Optional[torch.Tensor], inverse: bool, force: bool = False
     ) -> torch.Tensor:
         """
         Applies (or inverts) standard half-split RoPE to `x` (`[..., T, D]`) at absolute
@@ -1094,7 +1386,7 @@ class StoikovKVCache(DynamicCache):
         / `_apply_rotary_pos_emb`: `x_rot = x * cos + rotate_half(x) * sin`; the inverse uses `-sin`.
         """
         t_len = int(x.shape[-2])
-        if self.dict_key_frame != "pre_rope" or t_len == 0:
+        if (not force and self.dict_key_frame != "pre_rope") or t_len == 0:
             return x
         if positions is None:
             cos_tab, sin_tab = self._ensure_rope_table(t_len, x.device)
@@ -1135,7 +1427,19 @@ class StoikovKVCache(DynamicCache):
         Never requires `output_attentions=True`.
         """
         bsz, n_kv, q_len, d_head = key_states.shape
-        u_q_l = self.U_Q[layer_idx].to(device=key_states.device, dtype=torch.float32)  # [H, D, r]
+
+        # Pure FP16 retrieval layers never consume importance scores unless controller needs layer 0
+        if (
+            self._layer_all_fp16[layer_idx]
+            and self.controller_fn is None
+            and (layer_idx > 0 or not self.controller.enable_hmm_decay)
+        ):
+            zero_sc = torch.zeros((bsz, n_kv, q_len), device=key_states.device, dtype=torch.float32)
+            return zero_sc, float(self.controller.last_beta_t), self.keep_ratio, self.s_budget
+
+        if self._u_q_fp32.device != key_states.device:
+            self._u_q_fp32 = self._u_q_fp32.to(device=key_states.device)
+        u_q_l = self._u_q_fp32[layer_idx]  # [H, D, r]
         k_f = key_states.float()
         v_f = value_states.float()
 
@@ -1236,6 +1540,7 @@ class StoikovKVCache(DynamicCache):
                                 self.controller.shift_events += 1
                             else:
                                 b_step = self.controller.beta_stationary
+                        keep_ratio = self.controller.compute_dynamic_keep_ratio(start_pos + c_end)
                     else:
                         chunk_energy = proj[:, :, c_start:c_end, :].abs().mean(dim=(0, 2))
                         b_step, keep_ratio, s_budget = self.controller.observe_and_query(
@@ -1244,14 +1549,18 @@ class StoikovKVCache(DynamicCache):
                     if b_step < beta_t:
                         beta_t = b_step
                 self.controller.last_beta_t = float(beta_t)
-            else:
+            elif self.controller.enable_hmm_decay:
                 step_energy = proj.abs().mean(dim=(0, 2))
                 beta_t, keep_ratio, s_budget = self.controller.observe_and_query(
                     step_energy, seq_after
                 )
+            else:
+                beta_t = 1.0
+                keep_ratio = self.controller.compute_dynamic_keep_ratio(seq_after)
+                s_budget = self.s_budget
         else:
             beta_t = self.controller.last_beta_t
-            keep_ratio = self.keep_ratio
+            keep_ratio = self.controller.last_keep_ratio if self.controller.enable_stoikov_control else self.keep_ratio
             s_budget = self.s_budget
 
         return scores, float(beta_t), float(keep_ratio), int(s_budget)
@@ -1278,6 +1587,8 @@ class StoikovKVCache(DynamicCache):
         bsz, n_kv, n_over, d_head = overflow_k.shape
         if n_over == 0:
             return
+        self._layer_compact_k[layer_idx] = None
+        self._layer_compact_v[layer_idx] = None
 
         # A single non-finite activation would otherwise poison the persistent
         # compressed tier and make every later decode fail.  Preserve the valid
@@ -1309,8 +1620,8 @@ class StoikovKVCache(DynamicCache):
                     [prev_pos[keep_prev], overflow_pos], dim=0
                 )[-self.max_rollback_window :]
 
-        # Compute positional decay weights inside overflow chunk if n_over > 1
-        if n_over > 1:
+        # Compute positional decay weights inside overflow chunk only when a shift decay is active
+        if n_over > 1 and beta_t < 1.0:
             exps = torch.arange(n_over - 1, -1, -1, device=overflow_scores.device, dtype=torch.float32)
             if self._is_hf_model:
                 # Scale exponent per 16-token window so single-pass prefill does not underflow float32,
@@ -1332,6 +1643,12 @@ class StoikovKVCache(DynamicCache):
             k_h = overflow_k[:, h_idx, :, :]  # [B, n_over, D]
             v_h = overflow_v[:, h_idx, :, :]  # [B, n_over, D]
             sc_h = overflow_scores_decayed[:, h_idx, :]  # [B, n_over]
+
+            # HiKVP hierarchical offloaded path (un-rotates into pre-RoPE frame and offloads to CPU/mmap)
+            if self.hikvp_store is not None and self.hikvp_store.is_offloaded(layer_idx, h_idx):
+                k_pre = self._rope_rotate(k_h, overflow_pos, inverse=True, force=True)
+                self.hikvp_store.append_pre_rope(layer_idx, h_idx, k_pre, v_h, overflow_pos)
+                continue
 
             if st.role == ROLE_RETRIEVAL_FP16:
                 if st.fp16_k is None:
@@ -1431,16 +1748,18 @@ class StoikovKVCache(DynamicCache):
                     and st.lex_recon_atoms == self.active_atoms
                 ):
                     rk = self.codec.decode(
-                        k_idx[..., : self.active_atoms],
-                        k_val[..., : self.active_atoms],
+                        k_idx,
+                        k_val,
                         layer_idx=layer_idx,
+                        active_atoms=self.active_atoms,
                         check_bounds=False,
                     ).to(device=overflow_k.device, dtype=overflow_k.dtype)
                     rk = self._rope_rotate(rk, overflow_pos, inverse=False)
                     rv = self.codec.decode(
-                        v_idx[..., : self.active_atoms],
-                        v_val[..., : self.active_atoms],
+                        v_idx,
+                        v_val,
                         layer_idx=layer_idx,
+                        active_atoms=self.active_atoms,
                         check_bounds=False,
                     ).to(device=overflow_v.device, dtype=overflow_v.dtype)
                     st.lex_recon_k = torch.cat([st.lex_recon_k, rk], dim=-2)
@@ -1486,14 +1805,85 @@ class StoikovKVCache(DynamicCache):
         bsz, n_kv, win_len, d_head = local_k.shape
         total_seq_len = self._layer_seq_len[layer_idx]
         hist_len = max(0, total_seq_len - win_len)
+        local_pos = self._local_positions[layer_idx]
+        has_atlas = self.atlas_bank is not None
+        any_offloaded = self.hikvp_store is not None and any(
+            self.hikvp_store.is_offloaded(layer_idx, h_i) for h_i in range(n_kv)
+        )
+        q_layer: Optional[torch.Tensor] = (
+            self._get_pre_rope_query_for_layer(layer_idx, local_k, local_pos)
+            if (any_offloaded or has_atlas)
+            else None
+        )
 
         # Fast path when all tokens are still inside the n_b = 64 local FP16 sliding window
         if hist_len == 0:
             bytes_read = int(bsz * n_kv * win_len * 2 * d_head * 2)
-            return local_k, local_v, bytes_read
+            k_out, v_out = local_k, local_v
+            if has_atlas and q_layer is not None:
+                k_atlas, v_atlas, _, atlas_stats = self.atlas_bank.retrieve_and_rope_for_layer(
+                    layer_idx=layer_idx,
+                    query_pre_rope=q_layer,
+                    device=device,
+                    dtype=dtype,
+                    position_offset=0,
+                    use_original_positions=False,
+                )
+                t_atlas = int(k_atlas.shape[-2])
+                if t_atlas > 0:
+                    k_out = torch.cat([k_atlas, k_out], dim=-2)
+                    v_out = torch.cat([v_atlas, v_out], dim=-2)
+                    self._atlas_retrievals += 1
+                    self._atlas_tokens_retrieved += t_atlas
+                    self._atlas_pcie_bytes += int(atlas_stats.get("pcie_bytes", 0))
+                    bytes_read += int(bsz * n_kv * t_atlas * 2 * d_head * 2)
+            return k_out, v_out, bytes_read
 
-        roles_l = self.head_roles[layer_idx]
-        all_h2o = bool(torch.all(roles_l == ROLE_PEAKED_H2O).item())
+        all_fp16 = (not any_offloaded) and self._layer_all_fp16[layer_idx]
+        if all_fp16:
+            ck = self._layer_compact_k[layer_idx]
+            cv = self._layer_compact_v[layer_idx]
+            if ck is None or cv is None:
+                k_heads = [
+                    self._tiers[layer_idx][h_i].fp16_k
+                    if self._tiers[layer_idx][h_i].fp16_k is not None
+                    else torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
+                    for h_i in range(n_kv)
+                ]
+                v_heads = [
+                    self._tiers[layer_idx][h_i].fp16_v
+                    if self._tiers[layer_idx][h_i].fp16_v is not None
+                    else torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
+                    for h_i in range(n_kv)
+                ]
+                ck = torch.stack(k_heads, dim=1)
+                cv = torch.stack(v_heads, dim=1)
+                # Share underlying storage with per-head tiers so zero duplicate VRAM is retained
+                for h_i in range(n_kv):
+                    self._tiers[layer_idx][h_i].fp16_k = ck[:, h_i]
+                    self._tiers[layer_idx][h_i].fp16_v = cv[:, h_i]
+                self._layer_compact_k[layer_idx] = ck
+                self._layer_compact_v[layer_idx] = cv
+                self._layer_compact_bytes[layer_idx] = int(bsz * n_kv * int(ck.shape[-2]) * 2 * d_head * 2)
+            bytes_read = int(bsz * n_kv * win_len * 2 * d_head * 2) + self._layer_compact_bytes[layer_idx]
+            k_out = torch.cat([ck, local_k], dim=-2)
+            v_out = torch.cat([cv, local_v], dim=-2)
+            if has_atlas and q_layer is not None:
+                k_atlas, v_atlas, _, atlas_stats = self.atlas_bank.retrieve_and_rope_for_layer(
+                    layer_idx=layer_idx, query_pre_rope=q_layer, device=device, dtype=dtype,
+                    position_offset=0, use_original_positions=False,
+                )
+                t_atlas = int(k_atlas.shape[-2])
+                if t_atlas > 0:
+                    k_out = torch.cat([k_atlas, k_out], dim=-2)
+                    v_out = torch.cat([v_atlas, v_out], dim=-2)
+                    self._atlas_retrievals += 1
+                    self._atlas_tokens_retrieved += t_atlas
+                    self._atlas_pcie_bytes += int(atlas_stats.get("pcie_bytes", 0))
+                    bytes_read += int(bsz * n_kv * t_atlas * 2 * d_head * 2)
+            return k_out, v_out, bytes_read
+
+        all_h2o = (not any_offloaded) and self._layer_all_h2o[layer_idx]
 
         # Fast compact path when all heads in this layer are ROLE_PEAKED_H2O and all
         # incoming query positions lie inside the recent window (q_len <= win_len).
@@ -1501,44 +1891,96 @@ class StoikovKVCache(DynamicCache):
         # can attend directly to the compact [B, n_kv, k_kept + win_len, d_head] tensor
         # without padding to hist_len, scattering, or injecting anti_k dummy slots.
         if all_h2o and not self._hf_eager_mode and q_len <= win_len:
-            k_heads = []
-            v_heads = []
-            bytes_read = int(bsz * n_kv * win_len * 2 * d_head * 2)
-            kept_lens = [
-                int(self._tiers[layer_idx][h_idx].h2o_k.shape[-2])
-                if self._tiers[layer_idx][h_idx].h2o_k is not None
-                else 0
-                for h_idx in range(n_kv)
-            ]
-            max_kept = max(kept_lens) if kept_lens else 0
-            has_sink = (not self._is_hf_model) and (hist_len > max_kept)
-            for h_idx in range(n_kv):
-                st = self._tiers[layer_idx][h_idx]
-                k_kept = kept_lens[h_idx]
-                if k_kept > 0 and st.h2o_k is not None and st.h2o_v is not None:
-                    hk = st.h2o_k
-                    hv = st.h2o_v
-                    bytes_read += int(bsz * k_kept * 2 * d_head * 2)
+            ck = self._layer_compact_k[layer_idx]
+            cv = self._layer_compact_v[layer_idx]
+            if ck is None or cv is None:
+                k_heads = []
+                v_heads = []
+                hist_bytes = 0
+                kept_lens = [
+                    int(self._tiers[layer_idx][h_idx].h2o_k.shape[-2])
+                    if self._tiers[layer_idx][h_idx].h2o_k is not None
+                    else 0
+                    for h_idx in range(n_kv)
+                ]
+                max_kept = max(kept_lens) if kept_lens else 0
+                equal_kept = all(kl == max_kept for kl in kept_lens)
+                has_sink = (not self._is_hf_model) and (hist_len > max_kept)
+                for h_idx in range(n_kv):
+                    st = self._tiers[layer_idx][h_idx]
+                    k_kept = kept_lens[h_idx]
+                    if k_kept > 0 and st.h2o_k is not None and st.h2o_v is not None:
+                        hk = st.h2o_k
+                        hv = st.h2o_v
+                        hist_bytes += int(bsz * k_kept * 2 * d_head * 2)
+                    else:
+                        hk = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
+                        hv = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
+                    if hk.shape[-2] < max_kept:
+                        pad_n = max_kept - int(hk.shape[-2])
+                        anti_col = 0 if self._is_hf_model else -1
+                        anti_k = (-30.0 * self.U_Q[layer_idx, h_idx, :, anti_col]).to(dtype=dtype, device=device)
+                        hk = torch.cat([anti_k.view(1, 1, d_head).expand(bsz, pad_n, d_head), hk], dim=-2)
+                        hv = torch.cat([torch.zeros((bsz, pad_n, d_head), dtype=dtype, device=device), hv], dim=-2)
+                    if has_sink:
+                        n_evicted = max(1, hist_len - k_kept)
+                        u0 = self.U_Q[layer_idx, h_idx, :, 0].to(dtype=dtype, device=device)
+                        k_sink = (4.05 * math.log(n_evicted) * u0).view(1, 1, d_head).expand(bsz, 1, d_head)
+                        v_sink = torch.zeros((bsz, 1, d_head), dtype=dtype, device=device)
+                        hk = torch.cat([k_sink, hk], dim=-2)
+                        hv = torch.cat([v_sink, hv], dim=-2)
+                    k_heads.append(hk)
+                    v_heads.append(hv)
+                ck = torch.stack(k_heads, dim=1)
+                cv = torch.stack(v_heads, dim=1)
+                # Share underlying storage when all heads have equal kept length and no synthetic sink
+                if equal_kept and not has_sink and max_kept > 0:
+                    for h_idx in range(n_kv):
+                        self._tiers[layer_idx][h_idx].h2o_k = ck[:, h_idx]
+                        self._tiers[layer_idx][h_idx].h2o_v = cv[:, h_idx]
+                    self._layer_compact_k[layer_idx] = ck
+                    self._layer_compact_v[layer_idx] = cv
+                    self._layer_compact_bytes[layer_idx] = hist_bytes
                 else:
-                    hk = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
-                    hv = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
-                if hk.shape[-2] < max_kept:
-                    pad_n = max_kept - int(hk.shape[-2])
-                    anti_col = 0 if self._is_hf_model else -1
-                    anti_k = (-30.0 * self.U_Q[layer_idx, h_idx, :, anti_col]).to(dtype=dtype, device=device)
-                    hk = torch.cat([anti_k.view(1, 1, d_head).expand(bsz, pad_n, d_head), hk], dim=-2)
-                    hv = torch.cat([torch.zeros((bsz, pad_n, d_head), dtype=dtype, device=device), hv], dim=-2)
-                if has_sink:
-                    n_evicted = max(1, hist_len - k_kept)
-                    u0 = self.U_Q[layer_idx, h_idx, :, 0].to(dtype=dtype, device=device)
-                    k_sink = (4.05 * math.log(n_evicted) * u0).view(1, 1, d_head).expand(bsz, 1, d_head)
-                    v_sink = torch.zeros((bsz, 1, d_head), dtype=dtype, device=device)
-                    hk = torch.cat([k_sink, hk], dim=-2)
-                    hv = torch.cat([v_sink, hv], dim=-2)
-                k_heads.append(torch.cat([hk, local_k[:, h_idx]], dim=-2))
-                v_heads.append(torch.cat([hv, local_v[:, h_idx]], dim=-2))
-            k_out = torch.stack(k_heads, dim=1)
-            v_out = torch.stack(v_heads, dim=1)
+                    # Do not retain duplicate padded/sink buffers in VRAM if shapes differ
+                    bytes_read = int(bsz * n_kv * win_len * 2 * d_head * 2) + hist_bytes
+                    k_out = torch.cat([ck, local_k], dim=-2)
+                    v_out = torch.cat([cv, local_v], dim=-2)
+                    if has_atlas and q_layer is not None:
+                        k_atlas, v_atlas, _, atlas_stats = self.atlas_bank.retrieve_and_rope_for_layer(
+                            layer_idx=layer_idx, query_pre_rope=q_layer, device=device, dtype=dtype,
+                            position_offset=0, use_original_positions=False,
+                        )
+                        t_atlas = int(k_atlas.shape[-2])
+                        if t_atlas > 0:
+                            k_out = torch.cat([k_atlas, k_out], dim=-2)
+                            v_out = torch.cat([v_atlas, v_out], dim=-2)
+                            self._atlas_retrievals += 1
+                            self._atlas_tokens_retrieved += t_atlas
+                            self._atlas_pcie_bytes += int(atlas_stats.get("pcie_bytes", 0))
+                            bytes_read += int(bsz * n_kv * t_atlas * 2 * d_head * 2)
+                    return k_out, v_out, bytes_read
+
+            bytes_read = int(bsz * n_kv * win_len * 2 * d_head * 2) + self._layer_compact_bytes[layer_idx]
+            k_out = torch.cat([ck, local_k], dim=-2)
+            v_out = torch.cat([cv, local_v], dim=-2)
+            if has_atlas and q_layer is not None:
+                k_atlas, v_atlas, _, atlas_stats = self.atlas_bank.retrieve_and_rope_for_layer(
+                    layer_idx=layer_idx,
+                    query_pre_rope=q_layer,
+                    device=device,
+                    dtype=dtype,
+                    position_offset=0,
+                    use_original_positions=False,
+                )
+                t_atlas = int(k_atlas.shape[-2])
+                if t_atlas > 0:
+                    k_out = torch.cat([k_atlas, k_out], dim=-2)
+                    v_out = torch.cat([v_atlas, v_out], dim=-2)
+                    self._atlas_retrievals += 1
+                    self._atlas_tokens_retrieved += t_atlas
+                    self._atlas_pcie_bytes += int(atlas_stats.get("pcie_bytes", 0))
+                    bytes_read += int(bsz * n_kv * t_atlas * 2 * d_head * 2)
             return k_out, v_out, bytes_read
 
         k_heads = []
@@ -1548,6 +1990,29 @@ class StoikovKVCache(DynamicCache):
 
         for h_idx in range(n_kv):
             st = self._tiers[layer_idx][h_idx]
+            if self.hikvp_store is not None and self.hikvp_store.is_offloaded(layer_idx, h_idx):
+                assert q_layer is not None
+                k_ret_pre, v_ret, pos_ret, r_stats = self.hikvp_store.retrieve(
+                    layer_idx=layer_idx,
+                    head_idx=h_idx,
+                    query_pre_rope=q_layer[:, h_idx],
+                    device=device,
+                    dtype=dtype,
+                )
+                if self.hikvp_store.draft_mode:
+                    self._draft_pcie_bytes += int(r_stats.get("pcie_bytes", 0))
+                t_ret = int(k_ret_pre.shape[-2])
+                if t_ret > 0:
+                    hk = self._rope_rotate(k_ret_pre, pos_ret.to(device=device), inverse=False, force=True)
+                    hv = v_ret
+                    bytes_read += int(bsz * t_ret * 2 * d_head * 2)
+                else:
+                    hk = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
+                    hv = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
+                k_heads.append(torch.cat([hk, local_k[:, h_idx]], dim=-2))
+                v_heads.append(torch.cat([hv, local_v[:, h_idx]], dim=-2))
+                continue
+
             if st.role == ROLE_RETRIEVAL_FP16:
                 hk = st.fp16_k if st.fp16_k is not None else torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
                 hv = st.fp16_v if st.fp16_v is not None else torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
@@ -1564,9 +2029,10 @@ class StoikovKVCache(DynamicCache):
                     ):
                         if st.lex_k_idx is not None and st.lex_k_val is not None:
                             st.lex_recon_k = self.codec.decode(
-                                st.lex_k_idx[..., :m_atoms],
-                                st.lex_k_val[..., :m_atoms],
+                                st.lex_k_idx,
+                                st.lex_k_val,
                                 layer_idx=layer_idx,
+                                active_atoms=m_atoms,
                                 check_bounds=False,
                             ).to(device=device, dtype=dtype)
                             st.lex_recon_k = self._rope_rotate(
@@ -1575,9 +2041,10 @@ class StoikovKVCache(DynamicCache):
                                 inverse=False,
                             )
                             st.lex_recon_v = self.codec.decode(
-                                st.lex_v_idx[..., :m_atoms],
-                                st.lex_v_val[..., :m_atoms],
+                                st.lex_v_idx,
+                                st.lex_v_val,
                                 layer_idx=layer_idx,
+                                active_atoms=m_atoms,
                                 check_bounds=False,
                             ).to(device=device, dtype=dtype)
                             st.lex_recon_atoms = m_atoms
@@ -1591,24 +2058,28 @@ class StoikovKVCache(DynamicCache):
                     recon_len = st.lex_recon_len
                 else:
                     if st.lex_k_idx is not None and st.lex_k_val is not None:
+                        t_lex = int(st.lex_k_idx.shape[-2])
+                        c_half, s_half = None, None
+                        if self.dict_key_frame == "pre_rope" and t_lex > 0:
+                            self._ensure_rope_table(t_lex, device)
+                            c_half, s_half = self._rope_cos_half, self._rope_sin_half
                         rk = self.codec.decode(
-                            st.lex_k_idx[..., :m_atoms],
-                            st.lex_k_val[..., :m_atoms],
+                            st.lex_k_idx,
+                            st.lex_k_val,
                             layer_idx=layer_idx,
+                            active_atoms=m_atoms,
                             check_bounds=False,
+                            rope_cos=c_half,
+                            rope_sin=s_half,
                         ).to(device=device, dtype=dtype)
-                        rk = self._rope_rotate(
-                            rk,
-                            None,
-                            inverse=False,
-                        )
                         rv = self.codec.decode(
-                            st.lex_v_idx[..., :m_atoms],
-                            st.lex_v_val[..., :m_atoms],
+                            st.lex_v_idx,
+                            st.lex_v_val,
                             layer_idx=layer_idx,
+                            active_atoms=m_atoms,
                             check_bounds=False,
                         ).to(device=device, dtype=dtype)
-                        recon_len = int(rk.shape[-2])
+                        recon_len = t_lex
                     else:
                         rk = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
                         rv = torch.empty((bsz, 0, d_head), dtype=dtype, device=device)
@@ -1647,8 +2118,40 @@ class StoikovKVCache(DynamicCache):
                 k_heads.append(torch.cat([hk_pad, local_k[:, h_idx]], dim=-2))
                 v_heads.append(torch.cat([hv_pad, local_v[:, h_idx]], dim=-2))
 
+        # Align head sequence lengths if offloaded HiKVP heads returned fewer tokens than full hist_len
+        head_lens = [int(kh.shape[-2]) for kh in k_heads]
+        max_head_len = max(head_lens) if head_lens else 0
+        if any(hl != max_head_len for hl in head_lens):
+            anti_col = 0 if self._is_hf_model else -1
+            for h_idx in range(n_kv):
+                cur_len = head_lens[h_idx]
+                if cur_len < max_head_len:
+                    pad_n = max_head_len - cur_len
+                    anti_k = (-30.0 * self.U_Q[layer_idx, h_idx, :, anti_col]).to(dtype=dtype, device=device)
+                    k_pad = anti_k.view(1, 1, d_head).expand(bsz, pad_n, d_head)
+                    v_pad = torch.zeros((bsz, pad_n, d_head), dtype=dtype, device=device)
+                    k_heads[h_idx] = torch.cat([k_pad, k_heads[h_idx]], dim=-2)
+                    v_heads[h_idx] = torch.cat([v_pad, v_heads[h_idx]], dim=-2)
+
         k_out = torch.stack(k_heads, dim=1)
         v_out = torch.stack(v_heads, dim=1)
+        if has_atlas and q_layer is not None:
+            k_atlas, v_atlas, _, atlas_stats = self.atlas_bank.retrieve_and_rope_for_layer(
+                layer_idx=layer_idx,
+                query_pre_rope=q_layer,
+                device=device,
+                dtype=dtype,
+                position_offset=0,
+                use_original_positions=False,
+            )
+            t_atlas = int(k_atlas.shape[-2])
+            if t_atlas > 0:
+                k_out = torch.cat([k_atlas, k_out], dim=-2)
+                v_out = torch.cat([v_atlas, v_out], dim=-2)
+                self._atlas_retrievals += 1
+                self._atlas_tokens_retrieved += t_atlas
+                self._atlas_pcie_bytes += int(atlas_stats.get("pcie_bytes", 0))
+                bytes_read += int(bsz * n_kv * t_atlas * 2 * d_head * 2)
         return k_out, v_out, bytes_read
 
     @torch.no_grad()
@@ -1700,6 +2203,15 @@ class StoikovKVCache(DynamicCache):
 
             for h_idx in range(self.num_kv_heads):
                 st = self._tiers[l_idx][h_idx]
+                if self.hikvp_store is not None and self.hikvp_store.is_offloaded(l_idx, h_idx):
+                    h_index = self.hikvp_store.get_head(l_idx, h_idx)
+                    if h_index is not None:
+                        b_gpu = int(h_index.gpu_index_bytes() + h_index.gpu_lru_bytes())
+                        comp_bytes += b_gpu
+                        phys_fp16_equiv_bytes += b_gpu
+                        raw_bytes += b_gpu
+                        cnt_ret += int(bsz * h_index.num_tokens)
+                    continue
                 if st.role == ROLE_RETRIEVAL_FP16:
                     n_t = int(st.fp16_k.shape[-2]) if st.fp16_k is not None else 0
                     b_tier = int(bsz * n_t * vec_fp16_bytes)
@@ -1822,6 +2334,86 @@ class StoikovKVCache(DynamicCache):
         }
 
     @torch.no_grad()
+    def _ensure_local_slab(
+        self, layer_idx: int, bsz: int, n_kv: int, d_head: int, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        cap = self.n_b + self._decode_flush_stride
+        bk = self._local_buf_k[layer_idx]
+        if bk is None or bk.shape[0] != bsz or bk.shape[2] < cap or bk.dtype != dtype or bk.device != device or bk.is_inference():
+            with torch.inference_mode(False):
+                new_bk = torch.empty((bsz, n_kv, cap, d_head), dtype=dtype, device=device)
+                new_bv = torch.empty((bsz, n_kv, cap, d_head), dtype=dtype, device=device)
+                new_bsc = torch.empty((bsz, n_kv, cap), dtype=torch.float32, device=device)
+                new_bpos = torch.empty((cap,), dtype=torch.long, device=device)
+            lk = self._local_k[layer_idx]
+            if lk is not None and int(lk.shape[-2]) > 0 and int(lk.shape[-2]) <= cap and lk.shape[0] == bsz:
+                w = int(lk.shape[-2])
+                new_bk[:, :, :w, :].copy_(lk)
+                new_bv[:, :, :w, :].copy_(self._local_v[layer_idx])
+                new_bsc[:, :, :w].copy_(self._local_scores[layer_idx])
+                new_bpos[:w].copy_(self._local_positions[layer_idx])
+                self._local_k[layer_idx] = new_bk[:, :, :w, :]
+                self._local_v[layer_idx] = new_bv[:, :, :w, :]
+                self._local_scores[layer_idx] = new_bsc[:, :, :w]
+                self._local_positions[layer_idx] = new_bpos[:w]
+            self._local_buf_k[layer_idx] = new_bk
+            self._local_buf_v[layer_idx] = new_bv
+            self._local_buf_sc[layer_idx] = new_bsc
+            self._local_buf_pos[layer_idx] = new_bpos
+
+    @torch.no_grad()
+    def _flush_all_pending_overflow(self) -> None:
+        """Flushes any staged decode tokens above `n_b` down to exact `n_b` across all layers."""
+        for l_idx in range(self.num_layers):
+            lk = self._local_k[l_idx]
+            if lk is None or int(lk.shape[-2]) <= self.n_b:
+                continue
+            w = int(lk.shape[-2])
+            n_over = w - self.n_b
+            lv = self._local_v[l_idx]
+            lsc = self._local_scores[l_idx]
+            lpos = self._local_positions[l_idx]
+            over_k = lk[:, :, :n_over, :].clone()
+            over_v = lv[:, :, :n_over, :].clone()
+            over_sc = lsc[:, :, :n_over].clone()
+            over_pos = lpos[:n_over].clone()
+
+            bk = self._local_buf_k[l_idx]
+            if bk is not None and bk.shape[0] == lk.shape[0]:
+                bv = self._local_buf_v[l_idx]
+                bsc = self._local_buf_sc[l_idx]
+                bpos = self._local_buf_pos[l_idx]
+                rem_k = lk[:, :, n_over:, :].clone()
+                rem_v = lv[:, :, n_over:, :].clone()
+                rem_sc = lsc[:, :, n_over:].clone()
+                rem_pos = lpos[n_over:].clone()
+                bk[:, :, : self.n_b, :].copy_(rem_k)
+                bv[:, :, : self.n_b, :].copy_(rem_v)
+                bsc[:, :, : self.n_b].copy_(rem_sc)
+                bpos[: self.n_b].copy_(rem_pos)
+                self._local_k[l_idx] = bk[:, :, : self.n_b, :]
+                self._local_v[l_idx] = bv[:, :, : self.n_b, :]
+                self._local_scores[l_idx] = bsc[:, :, : self.n_b]
+                self._local_positions[l_idx] = bpos[: self.n_b]
+            else:
+                self._local_k[l_idx] = lk[:, :, n_over:, :]
+                self._local_v[l_idx] = lv[:, :, n_over:, :]
+                self._local_scores[l_idx] = lsc[:, :, n_over:]
+                self._local_positions[l_idx] = lpos[n_over:]
+
+            self._route_overflow_to_tiers(
+                layer_idx=l_idx,
+                overflow_k=over_k,
+                overflow_v=over_v,
+                overflow_scores=over_sc,
+                overflow_pos=over_pos,
+                beta_t=float(self.controller.last_beta_t),
+                keep_ratio=self.keep_ratio,
+                s_budget=self.s_budget,
+                total_seq_len=self._layer_seq_len[l_idx],
+            )
+
+    @torch.no_grad()
     def update(
         self,
         key_states: torch.Tensor,
@@ -1847,64 +2439,124 @@ class StoikovKVCache(DynamicCache):
         )
         new_pos = torch.arange(start_pos, new_seq_len, device=key_states.device, dtype=torch.long)
 
-        # Decay existing H2O scores and local window scores by beta_t^q_len
-        decay_factor = float(beta_t ** min(q_len, 64))
-        for h_idx in range(n_kv):
-            st = self._tiers[layer_idx][h_idx]
-            if st.role == ROLE_PEAKED_H2O and st.h2o_scores is not None:
-                st.h2o_scores = st.h2o_scores * decay_factor
+        # Decay existing H2O scores once per update step (1.0 when stationary, beta_shift on regime shift)
+        decay_factor = float(beta_t)
+        if decay_factor < 1.0:
+            for h_idx in range(n_kv):
+                st = self._tiers[layer_idx][h_idx]
+                if st.role == ROLE_PEAKED_H2O and st.h2o_scores is not None:
+                    st.h2o_scores = st.h2o_scores * decay_factor
 
-        # 2. Append to local FP16 sliding window
-        if self._local_k[layer_idx] is None:
-            cat_k = key_states
-            cat_v = value_states
-            cat_sc = new_scores
-            cat_pos = new_pos
+        # 2. Fast in-place slab path for single-token decode (zero torch.cat, batched tier flush)
+        cap = self.n_b + self._decode_flush_stride
+        cur_lk = self._local_k[layer_idx]
+        cur_w = int(cur_lk.shape[-2]) if cur_lk is not None else 0
+        if q_len == 1 and cur_w + 1 <= cap:
+            self._ensure_local_slab(layer_idx, bsz, n_kv, d_head, key_states.dtype, key_states.device)
+            bk = self._local_buf_k[layer_idx]
+            bv = self._local_buf_v[layer_idx]
+            bsc = self._local_buf_sc[layer_idx]
+            bpos = self._local_buf_pos[layer_idx]
+            if decay_factor < 1.0 and cur_w > 0:
+                bsc[:, :, :cur_w].mul_(decay_factor)
+            bk[:, :, cur_w : cur_w + 1, :].copy_(key_states)
+            bv[:, :, cur_w : cur_w + 1, :].copy_(value_states)
+            bsc[:, :, cur_w : cur_w + 1].copy_(new_scores)
+            bpos[cur_w : cur_w + 1].copy_(new_pos)
+            total_w = cur_w + 1
+
+            if total_w >= cap:
+                n_over = total_w - self.n_b
+                over_k = bk[:, :, :n_over, :].clone()
+                over_v = bv[:, :, :n_over, :].clone()
+                over_sc = bsc[:, :, :n_over].clone()
+                over_pos = bpos[:n_over].clone()
+                rem_k = bk[:, :, n_over:total_w, :].clone()
+                rem_v = bv[:, :, n_over:total_w, :].clone()
+                rem_sc = bsc[:, :, n_over:total_w].clone()
+                rem_pos = bpos[n_over:total_w].clone()
+                bk[:, :, : self.n_b, :].copy_(rem_k)
+                bv[:, :, : self.n_b, :].copy_(rem_v)
+                bsc[:, :, : self.n_b].copy_(rem_sc)
+                bpos[: self.n_b].copy_(rem_pos)
+                self._local_k[layer_idx] = bk[:, :, : self.n_b, :]
+                self._local_v[layer_idx] = bv[:, :, : self.n_b, :]
+                self._local_scores[layer_idx] = bsc[:, :, : self.n_b]
+                self._local_positions[layer_idx] = bpos[: self.n_b]
+                self._route_overflow_to_tiers(
+                    layer_idx=layer_idx,
+                    overflow_k=over_k,
+                    overflow_v=over_v,
+                    overflow_scores=over_sc,
+                    overflow_pos=over_pos,
+                    beta_t=beta_t,
+                    keep_ratio=keep_ratio,
+                    s_budget=s_budget,
+                    total_seq_len=new_seq_len,
+                )
+            else:
+                self._local_k[layer_idx] = bk[:, :, :total_w, :]
+                self._local_v[layer_idx] = bv[:, :, :total_w, :]
+                self._local_scores[layer_idx] = bsc[:, :, :total_w]
+                self._local_positions[layer_idx] = bpos[:total_w]
         else:
-            cat_k = torch.cat([self._local_k[layer_idx], key_states], dim=-2)
-            cat_v = torch.cat([self._local_v[layer_idx], value_states], dim=-2)
-            cat_sc = torch.cat(
-                [self._local_scores[layer_idx] * decay_factor, new_scores], dim=-1
-            )
-            cat_pos = torch.cat([self._local_positions[layer_idx], new_pos], dim=0)
+            # Multi-token prefill / verification path: flush immediately to exact n_b
+            if cur_lk is None:
+                cat_k = key_states
+                cat_v = value_states
+                cat_sc = new_scores
+                cat_pos = new_pos
+            else:
+                prev_sc = self._local_scores[layer_idx] * decay_factor if decay_factor < 1.0 else self._local_scores[layer_idx]
+                cat_k = torch.cat([cur_lk, key_states], dim=-2)
+                cat_v = torch.cat([self._local_v[layer_idx], value_states], dim=-2)
+                cat_sc = torch.cat([prev_sc, new_scores], dim=-1)
+                cat_pos = torch.cat([self._local_positions[layer_idx], new_pos], dim=0)
 
-        # 3. Route tokens older than n_b = 64 into per-head tiers
-        total_in_buf = int(cat_k.shape[-2])
-        if total_in_buf > self.n_b:
-            n_over = total_in_buf - self.n_b
-            overflow_k = cat_k[:, :, :n_over, :]
-            overflow_v = cat_v[:, :, :n_over, :]
-            overflow_sc = cat_sc[:, :, :n_over]
-            overflow_pos = cat_pos[:n_over]
+            total_in_buf = int(cat_k.shape[-2])
+            if total_in_buf > self.n_b:
+                n_over = total_in_buf - self.n_b
+                overflow_k = cat_k[:, :, :n_over, :]
+                overflow_v = cat_v[:, :, :n_over, :]
+                overflow_sc = cat_sc[:, :, :n_over]
+                overflow_pos = cat_pos[:n_over]
+                keep_k = cat_k[:, :, n_over:, :]
+                keep_v = cat_v[:, :, n_over:, :]
+                keep_sc = cat_sc[:, :, n_over:]
+                keep_pos = cat_pos[n_over:]
+                self._route_overflow_to_tiers(
+                    layer_idx=layer_idx,
+                    overflow_k=overflow_k,
+                    overflow_v=overflow_v,
+                    overflow_scores=overflow_sc,
+                    overflow_pos=overflow_pos,
+                    beta_t=beta_t,
+                    keep_ratio=keep_ratio,
+                    s_budget=s_budget,
+                    total_seq_len=new_seq_len,
+                )
+            else:
+                keep_k, keep_v, keep_sc, keep_pos = cat_k, cat_v, cat_sc, cat_pos
 
-            self._local_k[layer_idx] = cat_k[:, :, n_over:, :]
-            self._local_v[layer_idx] = cat_v[:, :, n_over:, :]
-            self._local_scores[layer_idx] = cat_sc[:, :, n_over:]
-            self._local_positions[layer_idx] = cat_pos[n_over:]
-
-            self._route_overflow_to_tiers(
-                layer_idx=layer_idx,
-                overflow_k=overflow_k,
-                overflow_v=overflow_v,
-                overflow_scores=overflow_sc,
-                overflow_pos=overflow_pos,
-                beta_t=beta_t,
-                keep_ratio=keep_ratio,
-                s_budget=s_budget,
-                total_seq_len=new_seq_len,
-            )
-        else:
-            self._local_k[layer_idx] = cat_k
-            self._local_v[layer_idx] = cat_v
-            self._local_scores[layer_idx] = cat_sc
-            self._local_positions[layer_idx] = cat_pos
+            # Seed pre-allocated decode slab with the retained <= n_b local window
+            self._local_k[layer_idx] = None
+            self._ensure_local_slab(layer_idx, bsz, n_kv, d_head, key_states.dtype, key_states.device)
+            w_keep = int(keep_k.shape[-2])
+            self._local_buf_k[layer_idx][:, :, :w_keep, :].copy_(keep_k)
+            self._local_buf_v[layer_idx][:, :, :w_keep, :].copy_(keep_v)
+            self._local_buf_sc[layer_idx][:, :, :w_keep].copy_(keep_sc)
+            self._local_buf_pos[layer_idx][:w_keep].copy_(keep_pos)
+            self._local_k[layer_idx] = self._local_buf_k[layer_idx][:, :, :w_keep, :]
+            self._local_v[layer_idx] = self._local_buf_v[layer_idx][:, :, :w_keep, :]
+            self._local_scores[layer_idx] = self._local_buf_sc[layer_idx][:, :, :w_keep]
+            self._local_positions[layer_idx] = self._local_buf_pos[layer_idx][:w_keep]
 
         # 4. Materialize transient rectangular KV states for this layer's SDPA / FlashAttention call
         # without retaining full-sequence copies in self.key_cache, self.value_cache, or DynamicCache.layers.
         # During the initial bulk prefill (start_pos == 0 and q_len > 1), use the exact incoming
         # (key_states, value_states) for intra-prompt hidden-state propagation across layers while
         # storing only the compressed/evicted tiers in self._tiers for all subsequent decode/verify steps.
-        if self._is_hf_model and start_pos == 0 and q_len > 1:
+        if self._is_hf_model and self.atlas_bank is None and start_pos == 0 and q_len > 1:
             win_len = int(self._local_k[layer_idx].shape[-2])
             bytes_read = int(bsz * n_kv * win_len * 2 * d_head * 2)
             m_atoms = max(1, min(int(self.active_atoms), self.s_budget))
@@ -1928,10 +2580,20 @@ class StoikovKVCache(DynamicCache):
             layer_idx=layer_idx, dtype=key_states.dtype, device=key_states.device, q_len=q_len
         )
 
+        # During chunked prefill (start_pos > 0 and q_len > n_b), preserve the full incoming chunk
+        # uncompressed at the tail of (k_out, v_out) so intra-chunk causal attention is exact.
+        if start_pos > 0 and q_len > self.n_b:
+            win_len_cur = int(self._local_k[layer_idx].shape[-2]) if self._local_k[layer_idx] is not None else self.n_b
+            trim_tail = q_len if int(k_out.shape[-2]) >= q_len else min(win_len_cur, int(k_out.shape[-2]))
+            k_out = torch.cat([k_out[:, :, :-trim_tail, :], key_states], dim=-2)
+            v_out = torch.cat([v_out[:, :, :-trim_tail, :], value_states], dim=-2)
+
         self._layer_bytes_read[layer_idx] = bytes_read
         self.cumulative_bytes_read += bytes_read
         if layer_idx == self.num_layers - 1:
-            self._refresh_telemetry()
+            self.bytes_read_last_step = int(sum(self._layer_bytes_read))
+            if q_len > 1:
+                self._refresh_telemetry()
 
         return k_out, v_out
 
@@ -1949,11 +2611,19 @@ class StoikovKVCache(DynamicCache):
             return
 
         self._seen_tokens = max_length
+        if max_length == 0 and self.hikvp_store is not None:
+            self.hikvp_store.crop(0)
         for l_idx in range(self.num_layers):
             l_cur = self._layer_seq_len[l_idx]
             if l_cur <= max_length:
                 continue
             self._layer_seq_len[l_idx] = max_length
+            self._local_buf_k[l_idx] = None
+            self._local_buf_v[l_idx] = None
+            self._local_buf_sc[l_idx] = None
+            self._local_buf_pos[l_idx] = None
+            self._layer_compact_k[l_idx] = None
+            self._layer_compact_v[l_idx] = None
 
             if max_length == 0:
                 self._local_k[l_idx] = None
@@ -1973,13 +2643,15 @@ class StoikovKVCache(DynamicCache):
             target_win_len = min(self.n_b, max_length)
             target_hist_len = max(0, max_length - target_win_len)
 
-            # Reconstruct the exact local FP16 window `[target_hist_len .. max_length - 1]`
+            # Reconstruct the exact local FP16 window (preserving any unflushed decode staging tokens)
             lk = self._local_k[l_idx]
             lv = self._local_v[l_idx]
             lsc = self._local_scores[l_idx]
             lpos = self._local_positions[l_idx]
 
             if lk is not None and lpos is not None:
+                cur_hist_floor = int(lpos[0].item()) if lpos.numel() > 0 else target_hist_len
+                eff_hist_len = min(cur_hist_floor, target_hist_len)
                 # Combine ring buffer of recently flushed tokens with current local window
                 if self._flushed_ring_k[l_idx] is not None and self._flushed_ring_pos[l_idx] is not None:
                     comb_k = torch.cat([self._flushed_ring_k[l_idx], lk], dim=-2)
@@ -1989,14 +2661,14 @@ class StoikovKVCache(DynamicCache):
                 else:
                     comb_k, comb_v, comb_sc, comb_pos = lk, lv, lsc, lpos
 
-                valid_mask = (comb_pos >= target_hist_len) & (comb_pos < max_length)
+                valid_mask = (comb_pos >= eff_hist_len) & (comb_pos < max_length)
                 self._local_k[l_idx] = comb_k[:, :, valid_mask, :]
                 self._local_v[l_idx] = comb_v[:, :, valid_mask, :]
                 self._local_scores[l_idx] = comb_sc[:, :, valid_mask]
                 self._local_positions[l_idx] = comb_pos[valid_mask]
 
-                # Trim flushed ring buffer to `< target_hist_len`
-                ring_mask = comb_pos < target_hist_len
+                # Trim flushed ring buffer to `< eff_hist_len`
+                ring_mask = comb_pos < eff_hist_len
                 if torch.any(ring_mask):
                     self._flushed_ring_k[l_idx] = comb_k[:, :, ring_mask, :][:, :, -self.max_rollback_window :, :]
                     self._flushed_ring_v[l_idx] = comb_v[:, :, ring_mask, :][:, :, -self.max_rollback_window :, :]
@@ -2007,9 +2679,15 @@ class StoikovKVCache(DynamicCache):
                     self._flushed_ring_v[l_idx] = None
                     self._flushed_ring_scores[l_idx] = None
                     self._flushed_ring_pos[l_idx] = None
+                target_hist_len = eff_hist_len
 
             # Crop historical tiers to `< target_hist_len`
             for h_idx in range(self.num_kv_heads):
+                if self.hikvp_store is not None and self.hikvp_store.is_offloaded(l_idx, h_idx):
+                    h_index = self.hikvp_store.get_head(l_idx, h_idx)
+                    if h_index is not None:
+                        h_index.crop(target_hist_len)
+                    continue
                 st = self._tiers[l_idx][h_idx]
                 if st.role == ROLE_RETRIEVAL_FP16:
                     if st.fp16_k is not None:
@@ -2054,6 +2732,7 @@ class StoikovKVCache(DynamicCache):
 
     def get_telemetry_summary(self) -> Dict[str, Any]:
         """Returns a dictionary of memory and routing telemetry metrics."""
+        self._flush_all_pending_overflow()
         self._refresh_telemetry()
         ratio = (
             float(self.compressed_bytes) / float(self.fp16_bytes)
@@ -2093,5 +2772,10 @@ class StoikovKVCache(DynamicCache):
             "hmm_last_beta_t": self.controller.last_beta_t,
             "hmm_last_z_score": self.controller.last_z_score,
             "hmm_shift_events": self.controller.shift_events,
+            "stoikov_inventory_q": self.controller.last_inventory_q,
+            "stoikov_reservation_skew": self.controller.last_reservation_skew,
+            "stoikov_half_spread": self.controller.last_half_spread,
+            "effective_keep_ratio": self.controller.last_keep_ratio,
             "head_roles": self.head_roles.detach().cpu().tolist(),
+            "hikvp": self.hikvp_telemetry(),
         }

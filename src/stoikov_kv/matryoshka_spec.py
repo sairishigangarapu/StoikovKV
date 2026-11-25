@@ -24,6 +24,7 @@ without a separate draft model:
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -132,6 +133,10 @@ def matryoshka_speculative_generate(
     seed: int = 42,
     strict_rejection_sampling: bool = True,
     do_sample: bool = False,
+    prefill_chunk_size: int = 0,
+    stoikov_volatility_stop: bool = True,
+    gamma_risk: float = 0.5,
+    kappa_draft: float = 1.5,
 ) -> MatryoshkaSpecResult:
     """
     Runs Matryoshka Self-Speculative Decoding on `model` using `StoikovKVCache`.
@@ -199,15 +204,29 @@ def matryoshka_speculative_generate(
         # ------------------------------------------------------------------
         cache.crop(0)
         cache.set_matryoshka_mode(active_atoms=verify_atoms)
+        if hasattr(cache, "set_hikvp_draft_mode"):
+            cache.set_hikvp_draft_mode(False)
 
-        # Prefill the full prompt so telemetry reflects the full prompt cache state,
-        # then crop by 1 token so `last_token = input_ids[:, -1:]` initiates cycle 1 cleanly.
-        _ = model(
-            input_ids=input_ids,
-            past_key_values=cache,
-            use_cache=True,
-            output_attentions=False,
-        )
+        # Prefill the full prompt (optionally in bounded chunks to cap activation VRAM on 8GB GPUs)
+        # so telemetry reflects the full prompt cache state, then crop by 1 token so
+        # `last_token = input_ids[:, -1:]` initiates cycle 1 cleanly.
+        chunk_sz = int(prefill_chunk_size)
+        if chunk_sz > 0 and prompt_len > chunk_sz:
+            for c_start in range(0, prompt_len, chunk_sz):
+                c_end = min(prompt_len, c_start + chunk_sz)
+                _ = model(
+                    input_ids=input_ids[:, c_start:c_end],
+                    past_key_values=cache,
+                    use_cache=True,
+                    output_attentions=False,
+                )
+        else:
+            _ = model(
+                input_ids=input_ids,
+                past_key_values=cache,
+                use_cache=True,
+                output_attentions=False,
+            )
         prefill_fp16_bytes = int(cache.fp16_bytes)
         prefill_compressed_bytes = int(cache.compressed_bytes)
 
@@ -239,6 +258,8 @@ def matryoshka_speculative_generate(
 
             # ---- A. Draft Step (active_atoms = draft_atoms) ----
             cache.set_matryoshka_mode(active_atoms=draft_atoms)
+            if hasattr(cache, "set_hikvp_draft_mode"):
+                cache.set_hikvp_draft_mode(True)
             draft_ids: List[torch.Tensor] = []
             q_probs_list: List[torch.Tensor] = []
             logits_q_list: List[torch.Tensor] = []
@@ -279,15 +300,32 @@ def matryoshka_speculative_generate(
                 logits_q_list.append(logits_q[0].detach().float())
                 step_inp = cand_tok
 
-            # ---- B. Parallel Verify Step (1 forward pass of length cur_gamma + 1 with verify_atoms) ----
+                # Avellaneda-Stoikov confidence-spread early stop: halt speculative lookahead
+                # when instantaneous draft uncertainty sigma_draft^2 = 1 - (p_(1) - p_(2))^2 spikes,
+                # avoiding wasted draft forward passes while keeping exact lossless verification.
+                if stoikov_volatility_stop and j + 1 < cur_gamma and q_dist.shape[-1] >= 2:
+                    top2 = torch.topk(q_dist[0], k=2, largest=True).values
+                    margin = float((top2[0] - top2[1]).item())
+                    sigma_sq = 1.0 - margin * margin
+                    g_r = max(float(gamma_risk), 1e-4)
+                    k_d = max(float(kappa_draft), 1e-4)
+                    half_spread = 0.5 * g_r * sigma_sq + (1.0 / g_r) * math.log(1.0 + g_r / k_d)
+                    if margin < 0.15 * math.tanh(half_spread):
+                        break
+
+            n_draft = len(draft_ids)
+
+            # ---- B. Parallel Verify Step (1 forward pass of length n_draft + 1 with verify_atoms) ----
             # Roll back the draft KV updates before running the parallel verification pass.
-            # Feeding `[last_token, d_0, ..., d_{cur_gamma-1}]` (length `cur_gamma + 1`) computes
-            # all `cur_gamma` verification distributions `p_0 .. p_{cur_gamma-1}` AND the bonus
-            # next-token distribution `p_{cur_gamma}` in a single parallel forward pass.
+            # Feeding `[last_token, d_0, ..., d_{n_draft-1}]` (length `n_draft + 1`) computes
+            # all `n_draft` verification distributions `p_0 .. p_{n_draft-1}` AND the bonus
+            # next-token distribution `p_{n_draft}` in a single parallel forward pass.
             cache.crop(base_cache_len)
             cache.set_matryoshka_mode(active_atoms=verify_atoms)
+            if hasattr(cache, "set_hikvp_draft_mode"):
+                cache.set_hikvp_draft_mode(False)
 
-            verify_inp = torch.cat([last_token] + draft_ids, dim=1)  # [1, cur_gamma + 1]
+            verify_inp = torch.cat([last_token] + draft_ids, dim=1)  # [1, n_draft + 1]
 
             bytes_before_v = cache.cumulative_bytes_read
             out_p = model(
@@ -306,9 +344,9 @@ def matryoshka_speculative_generate(
                 raw_p
                 if strict_rejection_sampling
                 else _contextual_logits(model, raw_p, verify_inp)
-            )  # [1, cur_gamma + 1, vocab_size]
+            )  # [1, n_draft + 1, vocab_size]
             p_probs_list: List[torch.Tensor] = []
-            for j in range(cur_gamma):
+            for j in range(n_draft):
                 sup_step_p = recent_sup + [int(verify_inp[0, j].item())] + [
                     int(draft_ids[k].item()) for k in range(j)
                 ]
@@ -326,7 +364,7 @@ def matryoshka_speculative_generate(
             n_accepted_this_pass = 0
             rejected = False
 
-            for j in range(cur_gamma):
+            for j in range(n_draft):
                 tok_j = int(draft_ids[j].item())
                 q_dist_j = q_probs_list[j]
                 p_dist_j = p_probs_list[j]
@@ -389,18 +427,15 @@ def matryoshka_speculative_generate(
             accepted_per_pass_list.append(n_accepted_this_pass)
 
             if not rejected:
-                # All cur_gamma draft tokens were accepted!
-                # Because verify_inp had length `cur_gamma + 1` (`[last_token, d_0, ..., d_{cur_gamma-1}]`),
-                # the cache ALREADY holds `base_cache_len + cur_gamma + 1` verified tokens AND
-                # `logits_p_all[0, cur_gamma]` gives the bonus next token without an extra forward pass!
+                # All n_draft draft tokens were accepted!
                 if len(generated_tokens) < max_new_tokens:
                     sup_bonus = (
                         recent_sup
-                        + [int(verify_inp[0, cur_gamma].item())]
+                        + [int(verify_inp[0, n_draft].item())]
                         + [int(t.item()) for t in draft_ids]
                     )
                     p_bonus = _logits_to_probs(
-                        logits_p_all[0, cur_gamma : cur_gamma + 1],
+                        logits_p_all[0, n_draft : n_draft + 1],
                         temperature=temperature,
                         top_k=top_k,
                         suppress_ids=None if strict_rejection_sampling else sup_bonus,
@@ -429,6 +464,8 @@ def matryoshka_speculative_generate(
             cache.crop(target_final_len)
 
     finally:
+        if hasattr(cache, "set_hikvp_draft_mode"):
+            cache.set_hikvp_draft_mode(False)
         if was_training:
             model.train()
 
@@ -534,5 +571,6 @@ def matryoshka_speculative_generate(
             "prefill_compressed_bytes": prefill_compressed_bytes,
             "elapsed_sec": elapsed_sec,
             "tokens_per_sec": float(num_gen) / elapsed_sec,
+            "hikvp_telemetry": cache.hikvp_telemetry() if hasattr(cache, "hikvp_telemetry") else {},
         }
     )
