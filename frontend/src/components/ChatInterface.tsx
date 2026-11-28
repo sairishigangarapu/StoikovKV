@@ -102,6 +102,9 @@ export function ChatInterface({
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
+          if (buffer.length > 1048576) {
+            throw new Error('Stream buffer limit exceeded');
+          }
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 

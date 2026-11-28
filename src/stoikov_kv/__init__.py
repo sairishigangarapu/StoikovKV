@@ -31,8 +31,14 @@ from .cache import (
 )
 from .triton_kernels import (
     HAS_TRITON,
+    GPUHardwareProfile,
     can_use_triton,
+    detect_gpu_profile,
+    simulate_hardware_profile,
+    select_kernel_config,
     triton_lexico_reconstruct,
+    triton_fused_kv_lexico_materialize,
+    triton_fused_write_probe,
 )
 from .matryoshka_spec import (
     MatryoshkaSpecResult,
@@ -54,6 +60,7 @@ from .atlas_memory import (
     AtlasDocumentChunk,
     AtlasMemoryBank,
     format_kg_triples,
+    consolidate_kg_triples,
     apply_rope_to_atlas_keys,
     rectangular_attention,
 )
@@ -81,8 +88,14 @@ __all__ = [
     "HMMTopicShiftController",
     "stoikov_control_step",
     "HAS_TRITON",
+    "GPUHardwareProfile",
     "can_use_triton",
+    "detect_gpu_profile",
+    "simulate_hardware_profile",
+    "select_kernel_config",
     "triton_lexico_reconstruct",
+    "triton_fused_kv_lexico_materialize",
+    "triton_fused_write_probe",
     "create_mock_artifacts",
     "load_or_create_artifacts",
     "MatryoshkaSpecResult",
@@ -98,6 +111,7 @@ __all__ = [
     "AtlasDocumentChunk",
     "AtlasMemoryBank",
     "format_kg_triples",
+    "consolidate_kg_triples",
     "apply_rope_to_atlas_keys",
     "rectangular_attention",
 ]

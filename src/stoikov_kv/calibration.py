@@ -42,7 +42,16 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_stoikov")
+import json
+
+from ._security import (
+    ensure_secure_triton_cache_dir,
+    secure_atomic_write_bytes,
+    secure_torch_save,
+    validate_safe_path,
+)
+
+ensure_secure_triton_cache_dir()
 
 import numpy as np
 import torch
@@ -527,9 +536,7 @@ class FallbackQwen2Attention(nn.Module):
                 k_rope, v, self.layer_idx, cache_kwargs={"sin": sin, "cos": cos}
             )
 
-        k_rep = _repeat_kv(k_rope, self.num_key_value_groups)
-        v_rep = _repeat_kv(v, self.num_key_value_groups)
-        kv_len = int(k_rep.shape[-2])
+        kv_len = int(k_rope.shape[-2])
 
         if not output_attentions:
             has_padding = (
@@ -537,15 +544,32 @@ class FallbackQwen2Attention(nn.Module):
                 and attention_mask.numel() > 0
                 and not bool(torch.all(attention_mask != 0).item())
             )
+            use_native_gqa = self.num_key_value_groups > 1 and self.head_dim <= 256
             if q_len == 1 and not has_padding:
-                attn_output = F.scaled_dot_product_attention(
-                    q_rope, k_rep, v_rep, attn_mask=None, dropout_p=0.0, is_causal=False
-                )
+                if use_native_gqa:
+                    attn_output = F.scaled_dot_product_attention(
+                        q_rope, k_rope, v, attn_mask=None, dropout_p=0.0, is_causal=False, enable_gqa=True
+                    )
+                else:
+                    k_rep = _repeat_kv(k_rope, self.num_key_value_groups)
+                    v_rep = _repeat_kv(v, self.num_key_value_groups)
+                    attn_output = F.scaled_dot_product_attention(
+                        q_rope, k_rep, v_rep, attn_mask=None, dropout_p=0.0, is_causal=False
+                    )
             elif q_len == kv_len and not has_padding:
-                attn_output = F.scaled_dot_product_attention(
-                    q_rope, k_rep, v_rep, attn_mask=None, dropout_p=0.0, is_causal=True
-                )
+                if use_native_gqa:
+                    attn_output = F.scaled_dot_product_attention(
+                        q_rope, k_rope, v, attn_mask=None, dropout_p=0.0, is_causal=True, enable_gqa=True
+                    )
+                else:
+                    k_rep = _repeat_kv(k_rope, self.num_key_value_groups)
+                    v_rep = _repeat_kv(v, self.num_key_value_groups)
+                    attn_output = F.scaled_dot_product_attention(
+                        q_rope, k_rep, v_rep, attn_mask=None, dropout_p=0.0, is_causal=True
+                    )
             else:
+                k_rep = _repeat_kv(k_rope, self.num_key_value_groups)
+                v_rep = _repeat_kv(v, self.num_key_value_groups)
                 q_idx = torch.arange(q_len, device=q_rope.device).unsqueeze(1)
                 k_idx = torch.arange(kv_len, device=q_rope.device).unsqueeze(0)
                 causal_bool = k_idx <= ((kv_len - q_len) + q_idx)
@@ -559,6 +583,9 @@ class FallbackQwen2Attention(nn.Module):
             attn_output = self.o_proj(attn_output)
             kv_ret = None if past_key_value is not None else (k_rope, v)
             return attn_output, None, kv_ret
+
+        k_rep = _repeat_kv(k_rope, self.num_key_value_groups)
+        v_rep = _repeat_kv(v, self.num_key_value_groups)
 
         scores = torch.matmul(q_rope.float(), k_rep.float().transpose(-1, -2)) / math.sqrt(self.head_dim)
 
@@ -956,40 +983,59 @@ def _ensure_local_qwen_checkpoint_metadata(model_dir: str) -> None:
     if os.path.exists(index_path) and os.path.exists(config_path):
         return
 
+    MAX_SAFETENSORS_HEADER = 64 * 1024 * 1024  # 64 MiB hard cap against malformed header DoS
     weight_map: Dict[str, str] = {}
     shapes: Dict[str, List[int]] = {}
     total_size = 0
     for shard_path in shards:
+        if os.path.islink(shard_path):
+            raise ValueError(f"Refusing symlinked safetensors shard: {shard_path!r}")
         shard_name = os.path.basename(shard_path)
-        total_size += os.path.getsize(shard_path)
+        shard_size = os.path.getsize(shard_path)
+        if shard_size < 8:
+            raise ValueError(f"Malformed safetensors shard (<8 bytes): {shard_path!r}")
+        total_size += shard_size
         with open(shard_path, "rb") as f:
             header_len = struct.unpack("<Q", f.read(8))[0]
+            if header_len == 0 or header_len > min(MAX_SAFETENSORS_HEADER, shard_size - 8):
+                raise ValueError(
+                    f"Unsafe safetensors header length {header_len} in {shard_path!r}"
+                )
             header = json.loads(f.read(header_len).decode("utf-8"))
+        if not isinstance(header, dict):
+            raise ValueError(f"Safetensors header in {shard_path!r} must decode to a JSON object.")
         for k, v in header.items():
             if k == "__metadata__":
                 continue
-            weight_map[k] = shard_name
-            if isinstance(v, dict) and "shape" in v:
-                shapes[k] = list(v["shape"])
+            weight_map[str(k)] = shard_name
+            if isinstance(v, dict) and isinstance(v.get("shape"), list):
+                shapes[str(k)] = [int(dim) for dim in v["shape"]]
 
     if not os.path.exists(index_path) and weight_map:
-        with open(index_path, "w", encoding="utf-8") as f:
-            json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f, indent=2)
+        secure_atomic_write_bytes(
+            index_path,
+            json.dumps({"metadata": {"total_size": total_size}, "weight_map": weight_map}, indent=2).encode("utf-8"),
+        )
 
     if not os.path.exists(config_path) and "model.embed_tokens.weight" in shapes:
-        vocab_size, hidden_size = shapes["model.embed_tokens.weight"]
+        emb_shape = shapes["model.embed_tokens.weight"]
+        if len(emb_shape) != 2 or emb_shape[0] <= 0 or emb_shape[1] < 128:
+            raise ValueError(f"Invalid embed_tokens shape in safetensors header: {emb_shape}")
+        vocab_size, hidden_size = emb_shape
         inter_size = shapes.get("model.layers.0.mlp.gate_proj.weight", [18944, hidden_size])[0]
         q_out = shapes.get("model.layers.0.self_attn.q_proj.weight", [hidden_size, hidden_size])[0]
         k_out = shapes.get("model.layers.0.self_attn.k_proj.weight", [512, hidden_size])[0]
         head_dim = 128
-        num_q_heads = q_out // head_dim
-        num_kv_heads = k_out // head_dim
+        num_q_heads = max(1, q_out // head_dim)
+        num_kv_heads = max(1, k_out // head_dim)
         layer_indices = [
             int(k.split(".")[2])
             for k in weight_map
-            if k.startswith("model.layers.") and k.split(".")[2].isdigit()
+            if k.startswith("model.layers.") and len(k.split(".")) > 2 and k.split(".")[2].isdigit()
         ]
         num_layers = (max(layer_indices) + 1) if layer_indices else 28
+        if num_layers <= 0 or num_layers > 512:
+            raise ValueError(f"Unsafe inferred num_layers={num_layers} in safetensors header.")
         cfg_dict = {
             "architectures": ["Qwen2ForCausalLM"],
             "attention_dropout": 0.0,
@@ -1015,8 +1061,7 @@ def _ensure_local_qwen_checkpoint_metadata(model_dir: str) -> None:
             "use_sliding_window": False,
             "vocab_size": int(vocab_size),
         }
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(cfg_dict, f, indent=2)
+        secure_atomic_write_bytes(config_path, json.dumps(cfg_dict, indent=2).encode("utf-8"))
 
 
 def load_model_and_tokenizer(
@@ -1032,6 +1077,7 @@ def load_model_and_tokenizer(
     use_quanto: bool = False,
     quanto_dtype: str = "int4",
     attn_implementation: str = "sdpa",
+    trust_remote_code: bool = False,
 ) -> Tuple[nn.Module, Any]:
     """
     Loads a deterministic structured fallback by default.  Set
@@ -1064,8 +1110,15 @@ def load_model_and_tokenizer(
             os.environ.setdefault("HF_HOME", "/mnt/storage/AI/HuggingFace")
             os.environ.setdefault("HF_HUB_CACHE", "/mnt/storage/AI/HuggingFace/hub")
 
+        if "\x00" in model_name or ".." in model_name.replace("\\", "/").split("/"):
+            raise ValueError(f"Unsafe model_name path traversal refused: {model_name!r}")
+        eff_trust_remote = bool(trust_remote_code) or (
+            os.environ.get("STOIKOV_TRUST_REMOTE_CODE", "").strip() == "1"
+        )
         resolved_model_path = model_name
-        repo_tail = model_name.rstrip("/").split("/")[-1]
+        repo_tail = os.path.basename(model_name.rstrip("/"))
+        if not repo_tail or repo_tail in (".", ".."):
+            raise ValueError(f"Invalid model identifier: {model_name!r}")
         hf_hub_roots = [
             os.environ.get("HF_HUB_CACHE", ""),
             "/mnt/storage/AI/HuggingFace/hub",
@@ -1096,11 +1149,15 @@ def load_model_and_tokenizer(
             _ensure_local_qwen_checkpoint_metadata(resolved_model_path)
 
         try:
-            tokenizer = AutoTokenizer.from_pretrained(resolved_model_path, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                resolved_model_path, trust_remote_code=eff_trust_remote
+            )
         except Exception:
             hf_tok_id = "Qwen/Qwen2.5-7B-Instruct" if "7b" in model_name.lower() else "Qwen/Qwen2.5-1.5B-Instruct"
             try:
-                tokenizer = AutoTokenizer.from_pretrained(hf_tok_id, trust_remote_code=True)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    hf_tok_id, trust_remote_code=eff_trust_remote
+                )
             except Exception:
                 with open(os.path.join(resolved_model_path, "config.json"), "r", encoding="utf-8") as f:
                     v_sz = int(json.load(f).get("vocab_size", 151936))
@@ -1147,7 +1204,7 @@ def load_model_and_tokenizer(
             "max_memory": max_memory,
             "low_cpu_mem_usage": True,
             "attn_implementation": attn_implementation,
-            "trust_remote_code": True,
+            "trust_remote_code": eff_trust_remote,
         }
         if quantization_config is not None:
             model_kwargs["quantization_config"] = quantization_config
@@ -1207,7 +1264,12 @@ def _inspect_model_architecture(
     if not hasattr(model, "config"):
         raise ValueError("Model must expose a `.config` object with attention head metadata.")
 
-    cfg = model.config
+    cfg_root = model.config
+    cfg = (
+        getattr(cfg_root, "text_config", None)
+        if getattr(cfg_root, "num_hidden_layers", 0) == 0 and getattr(cfg_root, "text_config", None) is not None
+        else cfg_root
+    )
     num_layers = int(getattr(cfg, "num_hidden_layers", 0))
     num_q_heads = int(getattr(cfg, "num_attention_heads", 0))
     num_kv_heads = int(getattr(cfg, "num_key_value_heads", num_q_heads))
@@ -1239,7 +1301,14 @@ def _inspect_model_architecture(
 
     # Locate decoder layers list
     layers_module = None
-    for candidate_path in (("model", "layers"), ("layers",), ("transformer", "h"), ("gpt_neox", "layers")):
+    for candidate_path in (
+        ("model", "layers"),
+        ("model", "llm", "layers"),
+        ("model", "language_model", "layers"),
+        ("layers",),
+        ("transformer", "h"),
+        ("gpt_neox", "layers"),
+    ):
         cur: Any = model
         for attr in candidate_path:
             cur = getattr(cur, attr, None)
@@ -2506,10 +2575,7 @@ def calibrate_model(
     }
 
     if save_path:
-        parent = os.path.dirname(os.path.abspath(save_path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        torch.save(artifacts, save_path)
+        secure_torch_save(artifacts, save_path)
         print(f"[StoikovKV Calibration] Saved calibrated artifacts to {save_path}")
 
     return artifacts

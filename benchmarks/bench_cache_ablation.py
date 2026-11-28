@@ -37,12 +37,15 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_stoikov")
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 for _p in (ROOT_DIR, ROOT_DIR / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+from stoikov_kv._security import ensure_secure_mpl_cache_dir, ensure_secure_triton_cache_dir
+
+ensure_secure_mpl_cache_dir()
+ensure_secure_triton_cache_dir()
 
 import matplotlib
 

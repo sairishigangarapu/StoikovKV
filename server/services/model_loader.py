@@ -41,6 +41,7 @@ def load_model_and_tokenizer():
         device=device,
         dtype=dtype,
         use_real_model=False,
+        trust_remote_code=model_config.trust_remote_code,
     )
     
     _artifacts = load_or_create_artifacts(model, artifacts_path=str(ARTIFACTS_PATH), tokenizer=tokenizer)

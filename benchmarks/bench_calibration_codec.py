@@ -34,9 +34,16 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Tuple
 
-# Ensure MPLCONFIGDIR and TRITON_CACHE_DIR point to writable directories (/tmp)
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib_stoikov")
-os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_stoikov")
+# Ensure repo root is on sys.path and private cache dirs are configured before matplotlib/triton load
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (REPO_ROOT, os.path.join(REPO_ROOT, "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from stoikov_kv._security import ensure_secure_mpl_cache_dir, ensure_secure_triton_cache_dir
+
+ensure_secure_mpl_cache_dir()
+ensure_secure_triton_cache_dir()
 
 import matplotlib
 
@@ -44,12 +51,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
-# Ensure repo root is on sys.path
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (REPO_ROOT, os.path.join(REPO_ROOT, "src")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from stoikov_kv.calibration import (
     CALIBRATION_PROMPTS,

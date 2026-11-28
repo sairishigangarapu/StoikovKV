@@ -36,7 +36,9 @@ from scipy.stats import spearmanr
 import numpy as np
 import os
 
-os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_stoikov")
+from stoikov_kv._security import ensure_secure_triton_cache_dir
+
+ensure_secure_triton_cache_dir()
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 

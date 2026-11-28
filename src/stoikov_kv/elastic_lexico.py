@@ -34,7 +34,9 @@ import sys
 import time
 from typing import Any, Dict, Optional, Tuple, Union
 
-os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_stoikov")
+from ._security import ensure_secure_triton_cache_dir, safe_torch_load
+
+ensure_secure_triton_cache_dir()
 
 import torch
 import torch.nn.functional as F
@@ -78,9 +80,12 @@ class QuantizedInt8Values(torch.Tensor):
             require_grad=False,
         )
         sc = getattr(self, "scale", torch.zeros(1, device=raw.device, dtype=torch.float16))
-        # If leading dimensions were indexed, slice scale on matching leading dimensions
+        # Slice scale on matching leading dimensions while preserving the trailing scale axis [..., 1]
         if isinstance(item, tuple) and len(item) > 0 and sc.dim() == self.dim():
-            lead_item = item[:-1] + (slice(None),)
+            if Ellipsis in item or len(item) >= self.dim():
+                lead_item = item[:-1] + (slice(None),)
+            else:
+                lead_item = item
             try:
                 sc = sc[lead_item]
             except Exception:
@@ -289,11 +294,13 @@ class ElasticLexicoCodec:
         device: Optional[str] = None,
     ) -> "ElasticLexicoCodec":
         """Loads `ElasticLexicoCodec` from `calibrated_artifacts.pt` or an artifacts dictionary."""
-        if isinstance(artifacts_or_path, str):
+        if isinstance(artifacts_or_path, (str, os.PathLike)):
             map_loc = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-            data = torch.load(artifacts_or_path, map_location=map_loc, weights_only=False)
+            data = safe_torch_load(artifacts_or_path, map_location=map_loc)
         else:
             data = artifacts_or_path
+        if not isinstance(data, dict) or "D" not in data:
+            raise ValueError("Invalid artifacts payload: expected a dict containing tensor 'D'.")
         D = data["D"]
         W_ridge = data.get("W_ridge", None)
         if device is not None:
@@ -440,8 +447,12 @@ class ElasticLexicoCodec:
             return triton_lexico_reconstruct(
                 indices, float_values, d_layer_t, out_dtype=float_values.dtype
             )
-        atoms = F.embedding(indices.to(torch.long), d_layer_t)  # [..., m, head_dim]
-        return (atoms * float_values.unsqueeze(-1)).sum(dim=-2)  # [..., head_dim]
+        idx_long = indices.to(torch.long)
+        valid = (idx_long >= 0) & (idx_long < self.n_atoms)
+        safe_idx = idx_long.clamp(0, max(self.n_atoms - 1, 0))
+        safe_vals = torch.where(valid, float_values, torch.zeros_like(float_values))
+        atoms = F.embedding(safe_idx, d_layer_t)  # [..., m, head_dim]
+        return (atoms * safe_vals.unsqueeze(-1)).sum(dim=-2)  # [..., head_dim]
 
     def encode(
         self,

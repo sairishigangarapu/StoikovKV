@@ -53,7 +53,8 @@ def main() -> None:
     model, tokenizer, meta = load_real_model_auto("1.5b")
     device = torch.device("cuda:0")
     art_path = ROOT_DIR / "artifacts" / "real_qwen_1.5b_audit_artifacts.pt"
-    artifacts = torch.load(str(art_path), map_location=device, weights_only=False)
+    from stoikov_kv._security import safe_torch_load
+    artifacts = safe_torch_load(art_path, map_location=device)
 
     passages = load_paul_graham_essays(min_chars=2400, max_passages=40)
     # Pick a genuine high-entropy prose continuation point (H(p) > 2.0 nats) so rejection sampling

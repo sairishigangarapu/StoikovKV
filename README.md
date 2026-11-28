@@ -2,10 +2,10 @@
 
 **StoikovKV** is a hybrid KV-cache compression, closed-loop inventory control, and hierarchical offloading engine for Grouped-Query Attention (GQA) language models. It combines FlashAttention/SDPA-compatible write-time query-subspace probing (`output_attentions=False`), per-head role routing, fused Triton sparse dictionary decoding (+ RoPE), Avellaneda–Stoikov (2008) inventory/volatility control, 3-level CPU-offloaded `HiKVP`/`AtlasKV` retrieval, and Matryoshka self-speculative decoding.
 
-> **📊 Benchmark Numbers & Theory Documentation:**
-> Browse **[`docs/benchmarks/`](./docs/benchmarks/)** for the ordered benchmark documentation:
-> 1. **[`01_BENCHMARK_NUMBERS.md`](./docs/benchmarks/01_BENCHMARK_NUMBERS.md)** — Complete measured numbers across calibration, fused Triton decode (`26.2x` speedup, `33.5x` less temp VRAM), 1-step ElasticNet vs. OMP/FISTA, equal-budget cache ablations, Matryoshka speculative decoding, `HiKVP`/`AtlasKV` offloading, and 100% GPU `Qwen/Qwen2.5-7B-Instruct` (4-bit NF4) validation.
-> 2. **[`02_BENCHMARK_THEORY_AND_INTERPRETATION.md`](./docs/benchmarks/02_BENCHMARK_THEORY_AND_INTERPRETATION.md)** — Detailed theory guide explaining **what each test means**, **how each result was produced**, and **how to interpret the metrics** across all benchmark suites and all 33 unit tests.
+> **🏛️ System Architecture, Evolution & Benchmark Documentation:**
+> - **[`docs/SYSTEM_ARCHITECTURE_AND_EVOLUTION.md`](./docs/SYSTEM_ARCHITECTURE_AND_EVOLUTION.md)** — Complete end-to-end topological architecture, subsystem derivations, defense-in-depth security model, 7-phase project evolution, and master benchmark tables.
+> - **[`docs/benchmarks/01_BENCHMARK_NUMBERS.md`](./docs/benchmarks/01_BENCHMARK_NUMBERS.md)** — Complete measured numbers across calibration, multi-arch fused Triton kernels (`7.57x` 3D KV materialize, `288.85x` batch-deferred probe, `26.2x` 16K decode), 1-step ElasticNet vs. OMP/FISTA, 6-way equal-budget ablations, Matryoshka speculative decoding, `HiKVP`/`AtlasKV` (`MeMo` bidirectional KG2KV), 100% GPU `Qwen/Qwen2.5-7B-Instruct` (4-bit NF4: **`36.85 tok/s`**, `79.0%` KV saved, `100%` NIAH), and 48-pass looped `Inkling-2-Mini` (`77.6%` KV saved).
+> - **[`docs/benchmarks/02_BENCHMARK_THEORY_AND_INTERPRETATION.md`](./docs/benchmarks/02_BENCHMARK_THEORY_AND_INTERPRETATION.md)** — Detailed theory guide explaining **what each test means**, **how each result was produced**, and **how to interpret the metrics**.
 
 ---
 
@@ -87,9 +87,11 @@
 
 ## Engineering Status & Validation Summary
 
-- **Complete Unit & Integration Test Coverage:** All **33 unit tests** (`pytest tests/`) pass, including fused Triton decode+RoPE parity, lossless speculative rollback, and `HiKVP`/`AtlasKV` offloading.
-- **Physical == Logical KV Memory:** `StoikovKVCache` stores only tier-specific physical buffers (`fp16`, `h2o`, or packed `int16`/`int8` `lexico`) with zero duplicate `DynamicCache` storage.
-- **100% GPU `Qwen/Qwen2.5-7B-Instruct` Validation (8 GB RTX 4060):** In 4-bit NF4 (`bitsandbytes`), `StoikovKV` Hybrid achieves **`78.8%` KV memory savings** at `4K` context, **`100.0%` needle-in-a-haystack**, **`100.0%` context-drift top-1 (`P = 1.0000`)**, **`43.8%` multi-fact QA** (vs. `15.6%` H2O / `12.5%` Lexico), and **`19.33 tok/s`** decode throughput (`24.03 tok/s` on standalone H2O; `13.50 tok/s` on standalone Lexico, up `2.89x` from `4.67 tok/s`). See **[`docs/benchmarks/`](./docs/benchmarks/)** for full tables.
+- **Complete Unit, Multi-Arch GPU & Red-Team Security Test Coverage:** All **48 automated tests** (`pytest tests/`) pass, covering calibration, 3D fused Triton KV materialization, hardware-adaptive kernel selection (`Ada`, `Ampere`, `Hopper`, `Blackwell sm_100/sm_120`, `ROCm MI300X`, `Intel XPU`), quantitative microstructure control (`Avellaneda–Stoikov`, `Hawkes`, `GLFT/Almgren–Chriss`, `VPIN`), lossless speculative rollback, `HiKVP`/`AtlasKV` (`MeMo` bidirectional KG2KV), and defense-in-depth RCE/GPU-OOB/ASGI security hardening (`_security.py`).
+- **Physical == Logical KV Memory & Zero-Cat Shared-Storage Slabs:** `StoikovKVCache` binds historical `ck/cv` and the 64-token decode slab into unified storage so 63/64 decode steps execute as `O(1)` slices with zero `torch.cat` and zero duplicate `DynamicCache` buffers.
+- **100% GPU `Qwen/Qwen2.5-7B-Instruct` (4-bit NF4) & 48-Pass Looped `Inkling-2-Mini` Validation (8 GB RTX 4060):**
+  - `Qwen2.5-7B-Instruct` (NF4): **`36.85 tok/s`** (**`95.4%` of uncompressed FP16 `38.63 tok/s`**, up `1.91x` from `19.33 tok/s`), **`79.0%` physical KV savings** (`35.33 MB` vs `168.16 MB`), **`100.0%` NIAH** (vs `33.3%` H2O), and **`43.8%` multi-fact QA** (`3.5x` over static).
+  - `Inkling-2-Mini` (`48`-pass Looped GQA, `384` KV heads/token): **`395.81 MB -> 88.82 MB` (`77.6%` physical KV savings)** at **`36.04 tok/s`** with **`0.9837–0.9960` next-token logit cosine similarity**.
 
 ---
 

@@ -27,7 +27,7 @@ export function KVPressureGauge({ sessionId }: { sessionId: string }) {
     let isMounted = true;
     const load = async () => {
       try {
-        const res = await fetch(`/api/v1/system${sessionId ? `?session_id=${sessionId}` : ''}`);
+        const res = await fetch(`/api/v1/system${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`);
         if (res.ok) {
           const d = await res.json();
           if (isMounted) setStats(d);

@@ -49,7 +49,7 @@ export function HeadRouterMap({ sessionId }: HeadRouterMapProps) {
     let isMounted = true;
     const fetchRoles = async () => {
       try {
-        const url = sessionId ? `/api/v1/metrics?session_id=${sessionId}` : '/api/v1/metrics';
+        const url = sessionId ? `/api/v1/metrics?session_id=${encodeURIComponent(sessionId)}` : '/api/v1/metrics';
         const res = await fetch(url);
         if (res.ok) {
           const data = await res.json();

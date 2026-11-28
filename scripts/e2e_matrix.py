@@ -8,9 +8,13 @@ Usage:
 import json
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:3000"
+_parsed_root = urllib.parse.urlparse(ROOT)
+if _parsed_root.scheme not in ("http", "https") or not _parsed_root.netloc:
+    raise ValueError(f"Unsupported endpoint URL (must be http/https): {ROOT!r}")
 BASE = ROOT.rstrip("/") + "/api/v1"
 
 

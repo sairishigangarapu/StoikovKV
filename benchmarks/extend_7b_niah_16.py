@@ -42,7 +42,8 @@ def main() -> None:
 
     passages = load_paul_graham_essays(min_chars=2400, max_passages=40)
     model, tokenizer, meta = load_real_model_auto("7b")
-    artifacts = torch.load(str(art_path), map_location="cuda:0", weights_only=False)
+    from stoikov_kv._security import safe_torch_load
+    artifacts = safe_torch_load(art_path, map_location="cuda:0")
     emb_dev = next(model.model.embed_tokens.parameters()).device
 
     depths = [0.10, 0.25, 0.50, 0.75]

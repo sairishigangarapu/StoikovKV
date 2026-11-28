@@ -31,7 +31,9 @@ Design Highlights:
 from __future__ import annotations
 
 import json
+import math
 import os
+import stat
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -39,6 +41,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._security import (
+    safe_open_regular_read,
+    secure_atomic_write_bytes,
+    secure_makedirs,
+    validate_safe_path,
+)
 from .hikvp import HiKVPConfig, HiKVPStore
 
 ATLAS_BANK_VERSION: str = "1.0.0"
@@ -86,6 +94,47 @@ def format_kg_triples(
         o_clean = " ".join(str(obj).strip().split()).rstrip(".")
         formatted.append(f"{s_clean} | {r_clean}: {o_clean}.")
     return formatted
+
+
+def consolidate_kg_triples(
+    triples: Sequence[Union[AtlasTriple, Tuple[str, str, str]]],
+    max_inverse_subjects: int = 16,
+) -> List[str]:
+    """
+    MeMo-inspired (`arXiv:2605.15156`) zero-SFT CPU entity consolidation & bidirectional
+    surfacing for `KG2KV`:
+    1. Deduplicates and groups outgoing attributes per subject (`"{S} | {r1}: {o1}; {r2}: {o2}."`)
+       so related facts co-locate in sharp-centroid HiKVP leaf pages.
+    2. Emits bounded inverse entity records (`"{O} | inverse_{r}: {s1}, {s2}."`) so `{s_i}` tokens
+       follow `{O}` in causal order, curing forward-only `KG2KV` causal value blindness in O(N) CPU.
+    """
+    fwd: Dict[str, List[str]] = {}
+    inv: Dict[Tuple[str, str], List[str]] = {}
+    cap = max(1, int(max_inverse_subjects))
+    for item in triples:
+        if isinstance(item, AtlasTriple):
+            subj, rel, obj = item.subject, item.relation, item.obj
+        elif isinstance(item, (tuple, list)) and len(item) == 3:
+            subj, rel, obj = item[0], item[1], item[2]
+        else:
+            raise ValueError(
+                f"Expected AtlasTriple or 3-tuple (subject, relation, obj), got: {item!r}"
+            )
+        s_c = " ".join(str(subj).strip().split())
+        r_c = " ".join(str(rel).strip().split())
+        o_c = " ".join(str(obj).strip().split()).rstrip(".")
+        fwd.setdefault(s_c, []).append(f"{r_c}: {o_c}")
+        if o_c:
+            bucket = inv.setdefault((o_c, r_c), [])
+            if len(bucket) < cap and s_c not in bucket:
+                bucket.append(s_c)
+    out = [f"{s_c} | {'; '.join(rels)}." for s_c, rels in fwd.items()]
+    out.extend(
+        f"{o_c} | inverse_{r_c}: {', '.join(subs)}."
+        for (o_c, r_c), subs in inv.items()
+        if subs
+    )
+    return out
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -217,21 +266,35 @@ def rectangular_attention(
         k_cat = k_live_rope
         v_cat = v_live
 
-    k_rep = _repeat_kv(k_cat, q_per_kv)
-    v_rep = _repeat_kv(v_cat, q_per_kv)
     t_total = t_atlas + t_live
+    use_native_gqa = q_per_kv > 1 and head_dim <= 256
 
     # Fast path: single-token decode (Q == 1) without custom atlas mask needs no mask tensor.
     if q_len == 1 and atlas_valid_mask is None:
+        if use_native_gqa:
+            return F.scaled_dot_product_attention(
+                q_rope, k_cat, v_cat, attn_mask=None, dropout_p=0.0, is_causal=False, enable_gqa=True
+            )
+        k_rep = _repeat_kv(k_cat, q_per_kv)
+        v_rep = _repeat_kv(v_cat, q_per_kv)
         return F.scaled_dot_product_attention(
             q_rope, k_rep, v_rep, attn_mask=None, dropout_p=0.0, is_causal=False
         )
 
     # Fast path: no Atlas prefix, pure causal self-attention with Q == T_live.
     if not has_atlas and is_causal_live and q_len == t_live and atlas_valid_mask is None:
+        if use_native_gqa:
+            return F.scaled_dot_product_attention(
+                q_rope, k_cat, v_cat, attn_mask=None, dropout_p=0.0, is_causal=True, enable_gqa=True
+            )
+        k_rep = _repeat_kv(k_cat, q_per_kv)
+        v_rep = _repeat_kv(v_cat, q_per_kv)
         return F.scaled_dot_product_attention(
             q_rope, k_rep, v_rep, attn_mask=None, dropout_p=0.0, is_causal=True
         )
+
+    k_rep = _repeat_kv(k_cat, q_per_kv)
+    v_rep = _repeat_kv(v_cat, q_per_kv)
 
     # Rectangular attention boolean mask [1 or B, 1 or H_q, Q, T_atlas + T_live]:
     # All queries may attend to Atlas prefix [0 .. T_atlas - 1]; live keys follow causality.
@@ -285,7 +348,12 @@ def _inspect_model_for_atlas(model: nn.Module) -> Dict[str, Any]:
     if not hasattr(model, "config"):
         raise ValueError("Model must expose a `.config` attribute with transformer dimensions.")
 
-    cfg = model.config
+    cfg_root = model.config
+    cfg = (
+        getattr(cfg_root, "text_config", None)
+        if getattr(cfg_root, "num_hidden_layers", 0) == 0 and getattr(cfg_root, "text_config", None) is not None
+        else cfg_root
+    )
     num_layers = int(getattr(cfg, "num_hidden_layers", 0))
     num_q_heads = int(getattr(cfg, "num_attention_heads", 0))
     num_kv_heads = int(getattr(cfg, "num_key_value_heads", num_q_heads))
@@ -309,6 +377,8 @@ def _inspect_model_for_atlas(model: nn.Module) -> Dict[str, Any]:
     layers_module = None
     for candidate_path in (
         ("model", "layers"),
+        ("model", "llm", "layers"),
+        ("model", "language_model", "layers"),
         ("layers",),
         ("transformer", "h"),
         ("gpt_neox", "layers"),
@@ -660,13 +730,20 @@ class AtlasMemoryBank:
         hikvp_config: Optional[HiKVPConfig] = None,
         triples_per_chunk: int = 16,
         all_heads: bool = True,
+        consolidate_bidirectional: bool = False,
+        max_inverse_subjects: int = 16,
     ) -> "AtlasMemoryBank":
         """
         Formats Knowledge Graph triples (`KG2KV`) into attention-native factual sentences,
         batches them into chunks of `triples_per_chunk` joined by `\\n`, and builds a
-        pre-RoPE `AtlasMemoryBank`.
+        pre-RoPE `AtlasMemoryBank`. When `consolidate_bidirectional=True`, applies MeMo-inspired
+        (`arXiv:2605.15156`) zero-SFT entity consolidation and inverse relation surfacing.
         """
-        sentences = format_kg_triples(triples)
+        sentences = (
+            consolidate_kg_triples(triples, max_inverse_subjects=max_inverse_subjects)
+            if consolidate_bidirectional
+            else format_kg_triples(triples)
+        )
         per_chunk = max(1, int(triples_per_chunk))
 
         batched_texts: List[str] = []
@@ -925,9 +1002,9 @@ class AtlasMemoryBank:
         - `hikvp_store.pt`: serialized `HiKVPStore` via `self.store.save(...)`
         - `atlas_meta.json`: document chunks, `rope_theta`, and metadata
         """
-        os.makedirs(directory, exist_ok=True)
-        store_path = os.path.join(directory, "hikvp_store.pt")
-        meta_path = os.path.join(directory, "atlas_meta.json")
+        safe_dir = secure_makedirs(directory)
+        store_path = os.path.join(safe_dir, "hikvp_store.pt")
+        meta_path = os.path.join(safe_dir, "atlas_meta.json")
 
         self.store.save(store_path)
 
@@ -937,8 +1014,10 @@ class AtlasMemoryBank:
             "metadata": _json_safe(self.metadata),
             "chunks": [asdict(c) for c in self.chunks],
         }
-        with open(meta_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        secure_atomic_write_bytes(
+            meta_path,
+            json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
+        )
 
         return directory
 
@@ -951,18 +1030,24 @@ class AtlasMemoryBank:
         """
         Loads a previously saved `AtlasMemoryBank` from `directory`.
         """
-        store_path = os.path.join(directory, "hikvp_store.pt")
-        meta_path = os.path.join(directory, "atlas_meta.json")
+        resolved_dir = validate_safe_path(directory)
+        store_path = os.path.join(str(resolved_dir), "hikvp_store.pt")
+        meta_path = os.path.join(str(resolved_dir), "atlas_meta.json")
 
-        if not os.path.isfile(store_path):
+        if not os.path.exists(store_path):
             raise FileNotFoundError(f"Missing HiKVPStore checkpoint at: {store_path}")
-        if not os.path.isfile(meta_path):
+        if not os.path.exists(meta_path):
             raise FileNotFoundError(f"Missing Atlas metadata JSON at: {meta_path}")
 
         store = HiKVPStore.load(store_path, U_Q=U_Q)
 
-        with open(meta_path, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
+        with safe_open_regular_read(meta_path, max_bytes=128 * 1024 * 1024) as fh:
+            payload = json.loads(fh.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Atlas metadata JSON root must be an object.")
+        raw_chunks = payload.get("chunks", [])
+        if not isinstance(raw_chunks, list) or len(raw_chunks) > 1_000_000:
+            raise ValueError("Invalid or excessive chunk list in Atlas metadata JSON.")
 
         chunks = [
             AtlasDocumentChunk(
@@ -972,9 +1057,11 @@ class AtlasMemoryBank:
                 start_pos=int(c["start_pos"]),
                 num_tokens=int(c["num_tokens"]),
             )
-            for c in payload.get("chunks", [])
+            for c in raw_chunks
         ]
         rope_theta = float(payload.get("rope_theta", 1000000.0))
+        if not math.isfinite(rope_theta) or rope_theta <= 0.0 or rope_theta > 1e10:
+            raise ValueError(f"Invalid rope_theta {rope_theta!r} in Atlas metadata.")
         metadata = dict(payload.get("metadata", {}))
         return cls(store=store, chunks=chunks, rope_theta=rope_theta, metadata=metadata)
 

@@ -4,5 +4,5 @@ model:
   device: "cuda"
   attn_implementation: "sdpa"
   max_seq_len: 32768
-  trust_remote_code: true
+  trust_remote_code: false
   fallback_to_mock: true

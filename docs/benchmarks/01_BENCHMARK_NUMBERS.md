@@ -252,3 +252,34 @@ Evaluated on `NVIDIA GeForce RTX 4060 Laptop GPU` (`s = 16` atoms, `head_dim = 1
   - `standalone_lexico`: **`5.49 -> 19.47 tok/s` (`3.55x` faster)** at `81.6%` KV savings
   - `hybrid` (`StoikovKV`): **`15.36 -> 22.16 tok/s` (`1.44x` faster)** at `78.6%` KV savings
   - `full_fp16`: **`24.64 -> 42.96 tok/s` (`1.74x` faster)**
+
+---
+
+## 9. Multi-Architecture GPU Engine, Microstructure Extensions, Real `Qwen2.5-7B` & `Inkling-2-Mini` (`bench_poc_7b_and_inkling.py`)
+
+Evaluated after adding unified shared-storage decode slabs (`_bind_unified_slab`), single-launch 3D multi-head `triton_fused_kv_lexico_materialize`, 64-token batch-deferred `triton_fused_write_probe`, multi-architecture hardware adaptation (`CUDA sm_80..sm_120`, `ROCm gfx942`, `Intel XPU`, `CPU`), Hawkes/GLFT/Almgren–Chriss/VPIN microstructure controls, zero-SFT `MeMo` bidirectional KG2KV consolidation (`arXiv:2605.15156`), and full defense-in-depth security hardening (`48/48` tests passing):
+
+### 9.1 Kernel & Controlled 28-Layer GQA Decode Speedups (`RTX 4060 Laptop GPU, sm_89`)
+- **`triton_fused_kv_lexico_materialize` (`4K` tokens, `H = 8`):** `1.508 ms -> 0.199 ms` (**`7.57x` faster**, max abs error `0.0e+00`)
+- **64-Token Batch-Deferred `triton_fused_write_probe`:** `6.943 ms -> 0.024 ms` (**`288.85x` faster**)
+- **Controlled 28-Layer GQA Decode (`ctx = 4,096, gen = 128`):**
+  - `StoikovKV Hybrid`: **`50.67 -> 89.58 tok/s`** (`19.73 -> 11.16 ms/tok`, **`+76.8%` throughput**)
+  - `Standalone Lexico`: **`29.37 -> 80.73 tok/s`** (`34.05 -> 12.39 ms/tok`, **`2.75x` faster**)
+  - `Standalone H2O`: **`63.59 -> 101.22 tok/s`** (**`+59.2%`**)
+  - `Full FP16`: **`75.54 -> 117.30 tok/s`** (**`+55.3%`**)
+
+### 9.2 Real `Qwen/Qwen2.5-7B-Instruct` (4-bit NF4, 100% GPU, `ctx = 2,063, gen = 96`)
+| Policy | Prior Speed (`tok/s`) | **Current Speed (`tok/s`)** | Latency (`ms/tok`) | Speedup vs. Prior | NIAH (`Early/Mid/Late`) | Physical = Logical KV (`MB`) | KV Savings |
+|---|---:|---:|---:|---:|---|---:|---:|
+| **Full FP16** | `24.43` | **`38.63`** | `25.89` | `1.58x` | **3/3 (100.0%)** | `168.16 MB` | `0.0%` |
+| **Standalone H2O** | `24.03` | **`38.97`** | `25.66` | `1.62x` | 1/3 (33.3%) | `28.71 MB` | `82.9%` |
+| **Standalone Lexico** | `13.50` | **`35.10`** | `28.49` | **`2.60x`** | 2/3 (66.7%) | `35.66 MB` | `78.8%` |
+| **StoikovKV Hybrid** | `19.33` | **`36.85`** | `27.14` | **`1.91x` (`95.4%` FP16)** | **3/3 (100.0%)** | **`35.33 MB`** | **`79.0%`** |
+
+### 9.3 Real-Weights `Inkling-2-Mini` (`48`-Pass Looped GQA, `384` KV Heads/Token, `ctx = 2,048, gen = 64`)
+| Policy (`Inkling-2-Mini` 48L) | Decode (`tok/s`) | Latency (`ms/tok`) | Physical = Logical KV (`MB`) | KV Savings | Next-Token Logit Cosine vs. FP16 |
+|---|---:|---:|---:|---:|---:|
+| **Full FP16** | `53.66` | `18.63` | `395.81 MB` | `0.0%` | `1.0000` |
+| **Standalone H2O** | `53.05` | `18.85` | `71.25 MB` | `82.0%` | `0.9784` |
+| **Standalone Lexico** | `38.99` | `25.65` | `86.96 MB` | `78.0%` | **`0.9960`** |
+| **StoikovKV Hybrid** | `36.04` | `27.75` | **`88.82 MB`** | **`77.6%`** | **`0.9837`** |

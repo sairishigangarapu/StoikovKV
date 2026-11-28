@@ -47,12 +47,14 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_stoikov")
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 for _p in (ROOT_DIR, ROOT_DIR / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+from stoikov_kv._security import ensure_secure_triton_cache_dir, safe_torch_load
+
+ensure_secure_triton_cache_dir()
 
 import torch
 
@@ -589,7 +591,7 @@ def benchmark_hf_mode(args: argparse.Namespace, device: torch.device) -> Dict[st
     model.eval()
     artifacts_path = getattr(args, "artifacts", None)
     if artifacts_path and os.path.isfile(artifacts_path):
-        artifacts = torch.load(artifacts_path, map_location="cpu", weights_only=False)
+        artifacts = safe_torch_load(artifacts_path, map_location="cpu")
     else:
         artifacts = load_or_create_artifacts(model=model, tokenizer=tokenizer)
     essays = _load_essays(args.corpus_dir)

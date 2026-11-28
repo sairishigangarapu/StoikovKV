@@ -30,12 +30,23 @@ from __future__ import annotations
 
 import contextlib
 import os
+import stat
+import tempfile
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+
+from ._security import (
+    safe_torch_load,
+    secure_atomic_write_bytes,
+    secure_makedirs,
+    secure_torch_save,
+    validate_safe_path,
+)
 
 # ============================================================================
 # Helpers
@@ -105,8 +116,7 @@ def _maybe_stream_ctx(stream: Optional[Any], device: torch.device):
 def _write_tensor_mmap(tensor: torch.Tensor, path: str) -> None:
     cpu_contig = tensor.detach().to(device="cpu").contiguous()
     raw_bytes = cpu_contig.view(torch.uint8).numpy().tobytes()
-    with open(path, "wb") as f:
-        f.write(raw_bytes)
+    secure_atomic_write_bytes(path, raw_bytes)
 
 
 def _read_tensor_mmap(
@@ -116,11 +126,37 @@ def _read_tensor_mmap(
 ) -> torch.Tensor:
     numel = 1
     for dim in shape:
-        numel *= int(dim)
+        d_i = int(dim)
+        if d_i < 0:
+            raise ValueError(f"Negative dimension in mmap tensor shape: {shape}")
+        numel *= d_i
     if numel == 0:
         return torch.empty(shape, dtype=dtype, device="cpu")
-    flat = torch.from_file(path, shared=False, size=numel, dtype=dtype)
+    resolved = validate_safe_path(path)
+    st = os.lstat(resolved)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"mmap backing file must be a regular non-symlink file: {str(resolved)!r}")
+    elem_bytes = torch.empty((), dtype=dtype).element_size()
+    expected_bytes = numel * elem_bytes
+    if st.st_size != expected_bytes:
+        raise ValueError(
+            f"mmap file size mismatch at {str(resolved)!r}: expected {expected_bytes} B, found {st.st_size} B"
+        )
+    flat = torch.from_file(str(resolved), shared=False, size=numel, dtype=dtype)
     return flat.view(shape)
+
+
+def _validate_deserialized_mmap_dir(
+    mmap_dir: Optional[str],
+    extra_roots: Optional[Sequence[Union[str, os.PathLike]]] = None,
+) -> Optional[str]:
+    """Validates `mmap_dir` coming from serialized state so untrusted checkpoints cannot write arbitrary paths."""
+    if mmap_dir is None:
+        return None
+    roots: List[Union[str, os.PathLike]] = [os.getcwd(), tempfile.gettempdir()]
+    if extra_roots:
+        roots.extend(extra_roots)
+    return str(validate_safe_path(mmap_dir, allowed_roots=roots))
 
 
 def _normalize_query(query_pre_rope: torch.Tensor, head_dim: int) -> torch.Tensor:
@@ -317,11 +353,16 @@ class HiKVPPage:
         return _tensor_nbytes(self.positions_cpu)
 
     def cleanup_mmap(self) -> None:
-        """Delete backing mmap files if present on disk."""
+        """Delete backing mmap files if present on disk (refuses symlinks and unexpected filenames)."""
         for p in (self.mmap_k_path, self.mmap_v_path):
             if p is not None:
                 try:
-                    os.remove(p)
+                    bname = os.path.basename(p)
+                    if not (bname.startswith("hikvp_") and bname.endswith(".bin")):
+                        continue
+                    st = os.lstat(p)
+                    if not stat.S_ISLNK(st.st_mode) and stat.S_ISREG(st.st_mode):
+                        os.remove(p)
                 except OSError:
                     pass
 
@@ -458,7 +499,7 @@ class HierarchicalKVHeadIndex:
                 )
 
         if self.config.mmap_dir is not None:
-            os.makedirs(self.config.mmap_dir, exist_ok=True)
+            secure_makedirs(self.config.mmap_dir)
 
         self.lru_cache: GPULRUPageCache = GPULRUPageCache(
             max_pages=self.config.max_hot_pages_per_head
@@ -683,7 +724,7 @@ class HierarchicalKVHeadIndex:
         v_cpu: Optional[torch.Tensor] = None
 
         if self.config.mmap_dir is not None:
-            os.makedirs(self.config.mmap_dir, exist_ok=True)
+            secure_makedirs(self.config.mmap_dir)
             prefix = (
                 f"hikvp_{self._instance_uid}_l{self.layer_idx}_h{self.head_idx}_p{page_id}"
             )
@@ -952,8 +993,11 @@ class HierarchicalKVHeadIndex:
                 g = max(float(self.config.gamma_risk), 1e-4)
                 kp = max(float(self.config.kappa_pcie), 1e-4)
                 sigma_norm_sq = (s_std * s_std) / (s_std * s_std + 1.0)
-                half_spread = 0.5 * g * sigma_norm_sq + (1.0 / g) * math.log(1.0 + g / kp)
-                cutoff = float(top_vals[0].item()) - (2.0 * half_spread * s_std)
+                half_spread_0 = 0.5 * g * sigma_norm_sq + (1.0 / g) * math.log(1.0 + g / 1.5)
+                half_spread_k = 0.5 * g * sigma_norm_sq + (1.0 / g) * math.log(1.0 + g / kp)
+                liq_rebate = max(0.0, half_spread_0 - half_spread_k)
+                eff_window = half_spread_0 + liq_rebate if kp > 1.5 else half_spread_k
+                cutoff = float(top_vals[0].item()) - (2.0 * eff_window * s_std)
                 keep_mask = top_vals >= cutoff
                 keep_mask[0] = True
                 top_local_p = top_idx_t[keep_mask].tolist()
@@ -1435,16 +1479,28 @@ class HierarchicalKVHeadIndex:
         cls,
         state: Dict[str, Any],
         u_q: Optional[torch.Tensor] = None,
+        allowed_mmap_roots: Optional[Sequence[Union[str, os.PathLike]]] = None,
     ) -> "HierarchicalKVHeadIndex":
+        if not isinstance(state, dict) or "config" not in state:
+            raise ValueError("Invalid HierarchicalKVHeadIndex state_dict.")
         cfg_dict = dict(state["config"])
         if "offload_roles" in cfg_dict:
-            cfg_dict["offload_roles"] = tuple(cfg_dict["offload_roles"])
+            cfg_dict["offload_roles"] = tuple(int(r) for r in cfg_dict["offload_roles"])
+        if cfg_dict.get("mmap_dir") is not None:
+            cfg_dict["mmap_dir"] = _validate_deserialized_mmap_dir(
+                str(cfg_dict["mmap_dir"]), extra_roots=allowed_mmap_roots
+            )
         config = HiKVPConfig(**cfg_dict)
+        if not (1 <= int(config.page_size) <= 65536 and 2 <= int(config.inter_fanout) <= 4096):
+            raise ValueError("Unsafe HiKVPConfig bounds in deserialized state_dict.")
+        head_dim = int(state["head_dim"])
+        if not (1 <= head_dim <= 2048):
+            raise ValueError(f"Invalid deserialized head_dim={head_dim}.")
         eff_u_q = u_q if u_q is not None else state.get("u_q")
         obj = cls(
             layer_idx=int(state["layer_idx"]),
             head_idx=int(state["head_idx"]),
-            head_dim=int(state["head_dim"]),
+            head_dim=head_dim,
             config=config,
             u_q=eff_u_q,
         )
@@ -1481,7 +1537,7 @@ class HierarchicalKVHeadIndex:
             page_id = len(obj._pages)
 
             if config.mmap_dir is not None:
-                os.makedirs(config.mmap_dir, exist_ok=True)
+                secure_makedirs(config.mmap_dir)
                 prefix = (
                     f"hikvp_{obj._instance_uid}_l{obj.layer_idx}_h{obj.head_idx}_p{page_id}"
                 )
@@ -1805,23 +1861,41 @@ class HiKVPStore:
                 key: head.state_dict() for key, head in self._heads.items()
             },
         }
-        torch.save(payload, path)
+        secure_torch_save(payload, path)
 
     @classmethod
     def load(
         cls,
         path: Union[str, os.PathLike],
         U_Q: Optional[torch.Tensor] = None,
+        mmap_dir: Optional[str] = None,
     ) -> "HiKVPStore":
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        resolved_ckpt = validate_safe_path(path)
+        payload = safe_torch_load(resolved_ckpt, map_location="cpu")
+        if not isinstance(payload, dict) or "config" not in payload:
+            raise ValueError("Invalid HiKVPStore checkpoint payload.")
+        ckpt_roots = [resolved_ckpt.parent]
         cfg_dict = dict(payload["config"])
         if "offload_roles" in cfg_dict:
-            cfg_dict["offload_roles"] = tuple(cfg_dict["offload_roles"])
+            cfg_dict["offload_roles"] = tuple(int(r) for r in cfg_dict["offload_roles"])
+        if mmap_dir is not None:
+            cfg_dict["mmap_dir"] = str(validate_safe_path(mmap_dir))
+        elif cfg_dict.get("mmap_dir") is not None:
+            cfg_dict["mmap_dir"] = _validate_deserialized_mmap_dir(
+                str(cfg_dict["mmap_dir"]), extra_roots=ckpt_roots
+            )
         config = HiKVPConfig(**cfg_dict)
+        num_layers = int(payload["num_layers"])
+        num_kv_heads = int(payload["num_kv_heads"])
+        head_dim = int(payload["head_dim"])
+        if not (1 <= num_layers <= 512 and 1 <= num_kv_heads <= 256 and 1 <= head_dim <= 2048):
+            raise ValueError(
+                f"Unsafe deserialized HiKVPStore dimensions: ({num_layers}, {num_kv_heads}, {head_dim})"
+            )
         store = cls(
-            num_layers=int(payload["num_layers"]),
-            num_kv_heads=int(payload["num_kv_heads"]),
-            head_dim=int(payload["head_dim"]),
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
             head_roles=payload["head_roles"],
             config=config,
             U_Q=U_Q,
@@ -1829,9 +1903,16 @@ class HiKVPStore:
         store._draft_mode = bool(payload.get("draft_mode", False))
         for key, h_state in payload.get("heads", {}).items():
             l_idx, h_idx = int(key[0]), int(key[1])
+            if not (0 <= l_idx < num_layers and 0 <= h_idx < num_kv_heads):
+                raise ValueError(f"Out-of-range head key ({l_idx}, {h_idx}) in HiKVPStore checkpoint.")
+            if mmap_dir is not None and isinstance(h_state, dict) and "config" in h_state:
+                h_state = dict(h_state)
+                h_cfg = dict(h_state["config"])
+                h_cfg["mmap_dir"] = cfg_dict["mmap_dir"]
+                h_state["config"] = h_cfg
             u_q_lh = U_Q[l_idx, h_idx] if U_Q is not None else None
             store._heads[(l_idx, h_idx)] = HierarchicalKVHeadIndex.from_state_dict(
-                h_state, u_q=u_q_lh
+                h_state, u_q=u_q_lh, allowed_mmap_roots=ckpt_roots
             )
             if h_idx not in store._layer_heads[l_idx]:
                 store._layer_heads[l_idx].append(h_idx)

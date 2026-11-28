@@ -29,7 +29,9 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_stoikov")
+from ._security import ensure_secure_triton_cache_dir
+
+ensure_secure_triton_cache_dir()
 
 import torch
 import torch.nn as nn

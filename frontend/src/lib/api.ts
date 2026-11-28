@@ -41,6 +41,9 @@ export async function* streamGenerate(request: GenerateRequest): AsyncGenerator<
       if (done) break;
       
       buffer += decoder.decode(value, { stream: true });
+      if (buffer.length > 1048576) {
+        throw new Error('SSE stream buffer limit exceeded');
+      }
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
       
@@ -56,7 +59,7 @@ export async function* streamGenerate(request: GenerateRequest): AsyncGenerator<
 }
 
 export async function getMetrics(sessionId: string) {
-  const res = await fetch(`/api/v1/metrics?session_id=${sessionId}`);
+  const res = await fetch(`/api/v1/metrics?session_id=${encodeURIComponent(sessionId)}`);
   return res.json();
 }
 

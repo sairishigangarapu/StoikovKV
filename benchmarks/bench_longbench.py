@@ -308,11 +308,13 @@ def main():
     print(f"Model loaded: {model.__class__.__name__} on {next(model.parameters()).device}")
     
     print("Running calibration...")
-    artifacts = calibrate_model(
-        model, tokenizer, 
-        save_path="/tmp/StoikovKV/calibrated_artifacts.pt",
-        seed=42, r_subspace=16, dict_atoms=64, dict_steps=10
-    )
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="stoikov_lb_") as _tmp_lb:
+        artifacts = calibrate_model(
+            model, tokenizer,
+            save_path=os.path.join(_tmp_lb, "calibrated_artifacts.pt"),
+            seed=42, r_subspace=16, dict_atoms=64, dict_steps=10
+        )
     
     codec = ElasticLexicoCodec.from_artifacts(artifacts)
     

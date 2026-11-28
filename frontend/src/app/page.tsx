@@ -20,7 +20,7 @@ export default function Home() {
     let isMounted = true;
     const load = async () => {
       try {
-        const url = sessionId ? `/api/v1/metrics?session_id=${sessionId}` : '/api/v1/metrics';
+        const url = sessionId ? `/api/v1/metrics?session_id=${encodeURIComponent(sessionId)}` : '/api/v1/metrics';
         const res = await fetch(url);
         if (res.ok) {
           const d = await res.json();
@@ -48,7 +48,7 @@ export default function Home() {
   const handleClearSession = async () => {
     if (sessionId) {
       try {
-        await fetch(`/api/v1/session/${sessionId}`, { method: 'DELETE' });
+        await fetch(`/api/v1/session/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
       } catch {}
       setSessionId('');
     }
